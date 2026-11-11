@@ -1,0 +1,13 @@
+{
+  "mcp": {
+    "servers": {
+      "xcode": {
+        "type": "local",
+        "command": [
+          "xcrun",
+          "mcpbridge"
+        ]
+      }
+    }
+  }
+}
