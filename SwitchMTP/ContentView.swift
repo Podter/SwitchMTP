@@ -10,13 +10,17 @@ import AppKit
 import AVKit
 
 struct ContentView: View {
-    @State private var viewModel: MTPViewModel
+    @Bindable var viewModel: MTPViewModel
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
+
+    init(viewModel: MTPViewModel) {
+        self.viewModel = viewModel
+    }
 
     init(initialInspectorOpen: Bool = false) {
         let vm = MTPViewModel()
         vm.showInspector = initialInspectorOpen
-        _viewModel = State(initialValue: vm)
+        self.viewModel = vm
     }
 
     var body: some View {
@@ -161,7 +165,6 @@ private struct ToolbarFilterSortMenu: View {
             } label: {
                 Label("Reload Device", systemImage: "arrow.clockwise")
             }
-            .keyboardShortcut("r", modifiers: .command)
             .disabled(viewModel.isConnecting)
         } label: {
             Label("Filter & Sort", systemImage: "line.3.horizontal.decrease.circle")
@@ -179,12 +182,7 @@ private struct ToolbarExportMenu: View {
 
         Menu {
             Button {
-                if !viewModel.selectedItems.isEmpty {
-                    viewModel.quickSaveToDownloads(viewModel.selectedItems)
-                } else {
-                    let visibleMedia = viewModel.filteredAndSortedItems.filter { !$0.isFolder }
-                    viewModel.quickSaveToDownloads(visibleMedia)
-                }
+                viewModel.saveSelectedOrAllToDownloads()
             } label: {
                 Label(
                     selectedCount == 0
@@ -195,11 +193,7 @@ private struct ToolbarExportMenu: View {
             }
 
             Button {
-                if !viewModel.selectedItems.isEmpty {
-                    viewModel.promptAndExportItems(viewModel.selectedItems)
-                } else {
-                    viewModel.promptAndExportAllVisible()
-                }
+                viewModel.exportSelectedOrAllToFolder()
             } label: {
                 Label(
                     selectedCount == 0
@@ -212,7 +206,7 @@ private struct ToolbarExportMenu: View {
             Label("Export", systemImage: "arrow.down.circle")
         }
         .disabled(!viewModel.isConnected || !hasItems)
-        .help("Save to Downloads or export to a folder")
+        .help("Save to Downloads (⌘S) or export to a folder (⇧⌘E)")
     }
 }
 
@@ -225,7 +219,6 @@ private struct ToolbarInspectorButton: View {
         } label: {
             Label("Inspector", systemImage: "sidebar.trailing")
         }
-        .keyboardShortcut("i", modifiers: .command)
         .help("Show or hide Inspector (⌘I)")
     }
 }
@@ -244,6 +237,13 @@ private struct ToolbarSearchField: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 13))
                 .focused($isFocused)
+                .onExitCommand {
+                    if !viewModel.searchText.isEmpty {
+                        viewModel.searchText = ""
+                    }
+                    isFocused = false
+                    viewModel.focusBrowserCanvas()
+                }
 
             if !viewModel.searchText.isEmpty {
                 Button {
@@ -259,6 +259,9 @@ private struct ToolbarSearchField: View {
         }
         .padding(.horizontal, 10)
         .frame(width: 168, height: 28)
+        .onChange(of: viewModel.searchFieldFocusRequestID) { _, _ in
+            isFocused = true
+        }
     }
 }
 
@@ -642,7 +645,8 @@ private struct MediaGridView: View {
                 itemWidth: itemWidth,
                 thumbHeight: thumbHeight,
                 spacing: spacing,
-                horizontalPadding: horizontalPadding
+                horizontalPadding: horizontalPadding,
+                focusRequestID: viewModel.browserFocusRequestID
             )
         }
         .background(Color(nsColor: .textBackgroundColor))
@@ -659,6 +663,7 @@ private struct GridInteractionOverlay: NSViewRepresentable {
     var thumbHeight: CGFloat
     var spacing: CGFloat
     var horizontalPadding: CGFloat
+    var focusRequestID: Int
 
     func makeNSView(context: Context) -> GridInteractionNSView {
         let view = GridInteractionNSView()
@@ -681,6 +686,12 @@ private struct GridInteractionOverlay: NSViewRepresentable {
         view.thumbHeight = thumbHeight
         view.spacing = spacing
         view.horizontalPadding = horizontalPadding
+        if view.lastBrowserFocusRequestID != viewModel.browserFocusRequestID {
+            view.lastBrowserFocusRequestID = viewModel.browserFocusRequestID
+            if let window = view.window, window.firstResponder !== view {
+                window.makeFirstResponder(view)
+            }
+        }
     }
 }
 
@@ -691,6 +702,7 @@ private final class GridInteractionNSView: NSView, NSDraggingSource {
     var thumbHeight: CGFloat = 100
     var spacing: CGFloat = 16
     var horizontalPadding: CGFloat = 20
+    var lastBrowserFocusRequestID: Int = 0
 
     private weak var cachedScrollView: NSScrollView?
     private var activeMarqueeRect: CGRect? = nil {
@@ -873,6 +885,7 @@ private final class GridInteractionNSView: NSView, NSDraggingSource {
                 } else {
                     viewModel.selectedItemIDs.insert(item.handle)
                     viewModel.selectionAnchorHandle = item.handle
+                    viewModel.keyboardCursorHandle = item.handle
                 }
                 pendingSingleSelectHandle = nil
             } else if flags.contains(.shift) {
@@ -884,6 +897,7 @@ private final class GridInteractionNSView: NSView, NSDraggingSource {
                 } else {
                     viewModel.selectedItemIDs = [item.handle]
                     viewModel.selectionAnchorHandle = item.handle
+                    viewModel.keyboardCursorHandle = item.handle
                     pendingSingleSelectHandle = nil
                 }
             }
@@ -961,6 +975,7 @@ private final class GridInteractionNSView: NSView, NSDraggingSource {
             } else if let pending = pendingSingleSelectHandle {
                 viewModel?.selectedItemIDs = [pending]
                 viewModel?.selectionAnchorHandle = pending
+                viewModel?.keyboardCursorHandle = pending
             }
         }
         dragCandidateItem = nil
@@ -983,6 +998,7 @@ private final class GridInteractionNSView: NSView, NSDraggingSource {
         if !viewModel.selectedItemIDs.contains(item.handle) {
             viewModel.selectedItemIDs = [item.handle]
             viewModel.selectionAnchorHandle = item.handle
+            viewModel.keyboardCursorHandle = item.handle
         }
 
         let targetItems = viewModel.selectedItems.isEmpty ? [item] : viewModel.selectedItems
@@ -995,18 +1011,104 @@ private final class GridInteractionNSView: NSView, NSDraggingSource {
         viewModel?.selectAll()
     }
 
+    @objc func copy(_ sender: Any?) {
+        viewModel?.performCopyCommand()
+    }
+
     override func cancelOperation(_ sender: Any?) {
         viewModel?.clearSelection()
     }
 
     override func keyDown(with event: NSEvent) {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
         if event.keyCode == 49 || event.keyCode == 36 { // Space or Return
             if let first = viewModel?.selectedItems.first {
                 viewModel?.openItem(first)
                 return
             }
         }
+
+        if flags.contains(.command) {
+            if event.keyCode == 126 { // Cmd + Up Arrow -> Enclosing Folder
+                viewModel?.navigateToEnclosingFolder()
+                return
+            } else if event.keyCode == 125 { // Cmd + Down Arrow -> Open Selected Item
+                viewModel?.openSelectedItem()
+                return
+            }
+        }
+
+        let cols = max(1, columnCount)
+        let extend = flags.contains(.shift)
+        switch event.keyCode {
+        case 123: // Left Arrow
+            moveGridSelection(by: -1, extendSelection: extend)
+            return
+        case 124: // Right Arrow
+            moveGridSelection(by: 1, extendSelection: extend)
+            return
+        case 126: // Up Arrow
+            moveGridSelection(by: -cols, extendSelection: extend)
+            return
+        case 125: // Down Arrow
+            moveGridSelection(by: cols, extendSelection: extend)
+            return
+        default:
+            break
+        }
+
         super.keyDown(with: event)
+    }
+
+    private func moveGridSelection(by delta: Int, extendSelection: Bool) {
+        guard let viewModel else { return }
+        let items = viewModel.filteredAndSortedItems
+        guard !items.isEmpty else { return }
+
+        let currentHandle = viewModel.keyboardCursorHandle
+            ?? viewModel.selectionAnchorHandle
+            ?? viewModel.selectedItems.last?.handle
+
+        let targetIndex: Int
+        if let currentHandle, let currentIndex = items.firstIndex(where: { $0.handle == currentHandle }) {
+            targetIndex = max(0, min(items.count - 1, currentIndex + delta))
+        } else {
+            targetIndex = delta >= 0 ? 0 : (items.count - 1)
+        }
+
+        let targetHandle = items[targetIndex].handle
+        if extendSelection {
+            if viewModel.selectionAnchorHandle == nil {
+                viewModel.selectionAnchorHandle = currentHandle ?? targetHandle
+            }
+            viewModel.selectRange(to: targetHandle, additive: false)
+        } else {
+            viewModel.selectedItemIDs = [targetHandle]
+            viewModel.selectionAnchorHandle = targetHandle
+            viewModel.keyboardCursorHandle = targetHandle
+        }
+
+        scrollContentFrameToVisible(resolvedContentFrame(at: targetIndex))
+    }
+
+    private func scrollContentFrameToVisible(_ frame: CGRect) {
+        guard let sv = backingScrollView(), let docView = sv.documentView else { return }
+        let clipView = sv.contentView
+        let visibleY = clipView.bounds.origin.y
+        let visibleH = clipView.bounds.height
+        let margin: CGFloat = 16
+        var targetY = visibleY
+        if frame.minY - margin < visibleY {
+            targetY = max(0, frame.minY - margin)
+        } else if frame.maxY + margin > visibleY + visibleH {
+            let maxScrollY = max(0, docView.bounds.height - visibleH)
+            targetY = min(maxScrollY, frame.maxY + margin - visibleH)
+        }
+        if abs(targetY - visibleY) > 0.5 {
+            clipView.scroll(to: NSPoint(x: clipView.bounds.origin.x, y: targetY))
+            sv.reflectScrolledClipView(clipView)
+        }
     }
 
     // MARK: - NSDraggingSource
@@ -1179,6 +1281,7 @@ private struct MediaTableView: View {
         let _ = viewModel.filteredAndSortedItems
         let _ = viewModel.selectedItemIDs
         let _ = viewModel.thumbnails.count
+        let _ = viewModel.browserFocusRequestID
         MediaTableRepresentable(viewModel: viewModel)
             .onExitCommand {
                 viewModel.clearSelection()
@@ -1255,6 +1358,7 @@ private struct MediaTableRepresentable: NSViewRepresentable {
         private var displayedItems: [MTPObjectItem] = []
         private var displayedHandles: [UInt32] = []
         private var knownThumbnailCount: Int = 0
+        private var lastBrowserFocusRequestID: Int = 0
         var isProgrammaticSelectionUpdate: Bool = false
 
         init(viewModel: MTPViewModel) {
@@ -1264,6 +1368,12 @@ private struct MediaTableRepresentable: NSViewRepresentable {
 
         func syncFromViewModel() {
             guard let tableView else { return }
+            if lastBrowserFocusRequestID != viewModel.browserFocusRequestID {
+                lastBrowserFocusRequestID = viewModel.browserFocusRequestID
+                if let window = tableView.window, window.firstResponder !== tableView {
+                    window.makeFirstResponder(tableView)
+                }
+            }
             let newItems = viewModel.filteredAndSortedItems
             let newHandles = newItems.map(\.handle)
             let itemsChanged = newHandles != displayedHandles
@@ -1805,11 +1915,25 @@ private final class FinderStyleTableView: NSTableView {
         coordinator?.pushTableSelectionToViewModel(selectedRowIndexes)
     }
 
+    @objc func copy(_ sender: Any?) {
+        coordinator?.viewModel.performCopyCommand()
+    }
+
     override func cancelOperation(_ sender: Any?) {
         coordinator?.viewModel.clearSelection()
     }
 
     override func keyDown(with event: NSEvent) {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags.contains(.command) {
+            if event.keyCode == 126 { // Cmd + Up Arrow -> Enclosing Folder
+                coordinator?.viewModel.navigateToEnclosingFolder()
+                return
+            } else if event.keyCode == 125 { // Cmd + Down Arrow -> Open Selected Item
+                coordinator?.viewModel.openSelectedItem()
+                return
+            }
+        }
         if event.keyCode == 49 || event.keyCode == 36 { // Space or Return
             if let first = coordinator?.viewModel.selectedItems.first {
                 coordinator?.viewModel.openItem(first)
@@ -2397,16 +2521,18 @@ private struct MediaLightboxSheet: View {
                     } label: {
                         Image(systemName: "chevron.left")
                     }
+                    .keyboardShortcut(.leftArrow, modifiers: [])
                     .disabled(!viewModel.canNavigatePreview(offset: -1, from: item))
-                    .help("Previous Item")
+                    .help("Previous Item (←)")
 
                     Button {
                         viewModel.navigatePreview(offset: 1, from: item)
                     } label: {
                         Image(systemName: "chevron.right")
                     }
+                    .keyboardShortcut(.rightArrow, modifiers: [])
                     .disabled(!viewModel.canNavigatePreview(offset: 1, from: item))
-                    .help("Next Item")
+                    .help("Next Item (→)")
                 }
 
                 VStack(alignment: .leading, spacing: 1) {
@@ -2429,6 +2555,8 @@ private struct MediaLightboxSheet: View {
                     } label: {
                         Label("Copy", systemImage: "doc.on.doc")
                     }
+                    .keyboardShortcut("c", modifiers: .command)
+                    .help("Copy Image (⌘C)")
                 }
 
                 Button {
@@ -2437,6 +2565,8 @@ private struct MediaLightboxSheet: View {
                     Label("Save", systemImage: "arrow.down.circle.fill")
                 }
                 .buttonStyle(.borderedProminent)
+                .keyboardShortcut("s", modifiers: .command)
+                .help("Save to Downloads (⌘S)")
 
                 Button {
                     dismiss()
@@ -2447,6 +2577,7 @@ private struct MediaLightboxSheet: View {
                 }
                 .buttonStyle(.plain)
                 .keyboardShortcut(.cancelAction)
+                .help("Close (Esc)")
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)

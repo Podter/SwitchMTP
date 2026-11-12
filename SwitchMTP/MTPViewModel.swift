@@ -125,7 +125,10 @@ final class MTPViewModel {
         }
     }
     @ObservationIgnored var selectionAnchorHandle: UInt32? = nil
+    @ObservationIgnored var keyboardCursorHandle: UInt32? = nil
     @ObservationIgnored lazy var dragCoordinator = MTPDragExportCoordinator(client: client, viewModel: self)
+    var searchFieldFocusRequestID: Int = 0
+    var browserFocusRequestID: Int = 0
     
     var searchText: String = "" {
         didSet {
@@ -585,12 +588,18 @@ final class MTPViewModel {
     }
     
     func selectAll() {
-        selectedItemIDs = Set(filteredAndSortedItems.map(\.handle))
+        let handles = filteredAndSortedItems.map(\.handle)
+        selectedItemIDs = Set(handles)
+        if selectionAnchorHandle == nil {
+            selectionAnchorHandle = handles.first
+        }
+        keyboardCursorHandle = handles.last
     }
     
     func clearSelection() {
         selectedItemIDs.removeAll()
         selectionAnchorHandle = nil
+        keyboardCursorHandle = nil
     }
     
     func selectRange(to targetHandle: UInt32, additive: Bool = false) {
@@ -598,14 +607,18 @@ final class MTPViewModel {
         guard let targetIndex = items.firstIndex(where: { $0.handle == targetHandle }) else {
             selectedItemIDs = [targetHandle]
             selectionAnchorHandle = targetHandle
+            keyboardCursorHandle = targetHandle
             return
         }
         let anchorHandle = selectionAnchorHandle ?? selectedItemIDs.first ?? targetHandle
         guard let anchorIndex = items.firstIndex(where: { $0.handle == anchorHandle }) else {
             selectedItemIDs = [targetHandle]
             selectionAnchorHandle = targetHandle
+            keyboardCursorHandle = targetHandle
             return
         }
+        selectionAnchorHandle = anchorHandle
+        keyboardCursorHandle = targetHandle
         let lower = min(anchorIndex, targetIndex)
         let upper = max(anchorIndex, targetIndex)
         let rangeHandles = Set(items[lower...upper].map(\.handle))
@@ -614,6 +627,187 @@ final class MTPViewModel {
         } else {
             selectedItemIDs = rangeHandles
         }
+    }
+    
+    // MARK: - Menu & Keyboard Command Actions
+    
+    var isTextInputFirstResponder: Bool {
+        guard let responder = NSApp.keyWindow?.firstResponder else { return false }
+        return responder is NSText || responder is NSTextView
+    }
+    
+    func focusSearchField() {
+        searchFieldFocusRequestID &+= 1
+    }
+    
+    func focusBrowserCanvas() {
+        browserFocusRequestID &+= 1
+    }
+    
+    func performSelectAllCommand() {
+        if isTextInputFirstResponder {
+            NSApp.sendAction(#selector(NSResponder.selectAll(_:)), to: nil, from: nil)
+            return
+        }
+        guard isConnected, !filteredAndSortedItems.isEmpty else { return }
+        selectAll()
+        focusBrowserCanvas()
+    }
+    
+    var canSelectAllItems: Bool {
+        if isTextInputFirstResponder { return true }
+        return isConnected && !filteredAndSortedItems.isEmpty
+    }
+    
+    var canCopyFromSelectionOrTextField: Bool {
+        if isTextInputFirstResponder { return true }
+        guard isConnected else { return false }
+        if let previewItem = fullScreenPreviewItem, previewItem.isImage {
+            return true
+        }
+        return selectedItems.contains(where: \.isImage)
+    }
+    
+    func performCopyCommand() {
+        if isTextInputFirstResponder {
+            NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil)
+            return
+        }
+        if let previewItem = fullScreenPreviewItem, previewItem.isImage {
+            copyImageToClipboard(previewItem)
+        } else if let imageItem = selectedItems.first(where: \.isImage) {
+            copyImageToClipboard(imageItem)
+        }
+    }
+    
+    var canOpenSelectedItem: Bool {
+        isConnected && !selectedItems.isEmpty
+    }
+    
+    func openSelectedItem() {
+        guard let first = selectedItems.first else { return }
+        openItem(first)
+    }
+    
+    var canQuickLookSelectedItem: Bool {
+        if fullScreenPreviewItem != nil { return true }
+        return isConnected && selectedItems.contains(where: { !$0.isFolder })
+    }
+    
+    func toggleQuickLookSelectedItem() {
+        if fullScreenPreviewItem != nil {
+            fullScreenPreviewItem = nil
+        } else if let item = selectedItems.first(where: { !$0.isFolder }) {
+            selectedItemIDs = [item.handle]
+            fullScreenPreviewItem = item
+        }
+    }
+    
+    var canOpenSelectedInDefaultApp: Bool {
+        guard isConnected else { return false }
+        if let previewItem = fullScreenPreviewItem, !previewItem.isFolder {
+            return true
+        }
+        return selectedItems.contains(where: { !$0.isFolder })
+    }
+    
+    func openSelectedInDefaultApp() {
+        if let previewItem = fullScreenPreviewItem, !previewItem.isFolder {
+            openInQuickLookOrDefaultApp(previewItem)
+        } else if let item = selectedItems.first(where: { !$0.isFolder }) {
+            openInQuickLookOrDefaultApp(item)
+        }
+    }
+    
+    var canSaveOrExport: Bool {
+        isConnected && !isTransferring && (fullScreenPreviewItem != nil || !selectedItems.isEmpty || !filteredAndSortedItems.isEmpty)
+    }
+    
+    var saveMenuTitle: String {
+        if fullScreenPreviewItem != nil {
+            return "Save to Downloads"
+        }
+        let count = selectedItemIDs.count
+        return count == 0 ? "Save All to Downloads" : "Save \(count) Selected to Downloads"
+    }
+    
+    var exportMenuTitle: String {
+        if fullScreenPreviewItem != nil {
+            return "Export…"
+        }
+        let count = selectedItemIDs.count
+        return count == 0 ? "Export All to Folder…" : "Export \(count) Selected to Folder…"
+    }
+    
+    func saveSelectedOrAllToDownloads() {
+        if let previewItem = fullScreenPreviewItem {
+            quickSaveToDownloads([previewItem])
+        } else if !selectedItems.isEmpty {
+            quickSaveToDownloads(selectedItems)
+        } else {
+            let visibleMedia = filteredAndSortedItems.filter { !$0.isFolder }
+            if !visibleMedia.isEmpty {
+                quickSaveToDownloads(visibleMedia)
+            } else {
+                quickSaveToDownloads(filteredAndSortedItems)
+            }
+        }
+    }
+    
+    func exportSelectedOrAllToFolder() {
+        if let previewItem = fullScreenPreviewItem {
+            promptAndExportItems([previewItem])
+        } else if !selectedItems.isEmpty {
+            let selected = selectedItems
+            if selected.allSatisfy(\.isFolder) {
+                promptAndExportFolders(selected)
+            } else {
+                promptAndExportItems(selected)
+            }
+        } else {
+            promptAndExportAllVisible()
+        }
+    }
+    
+    var canNavigateToEnclosingFolder: Bool {
+        if canGoBack { return true }
+        if case .gameFolder = selectedSidebar, !storages.isEmpty { return true }
+        return false
+    }
+    
+    func navigateToEnclosingFolder() {
+        if canGoBack {
+            navigateBack()
+        } else if case .gameFolder = selectedSidebar, let firstStorage = storages.first {
+            selectedSidebar = .storageRoot(firstStorage.id)
+        }
+    }
+    
+    var canZoomInGrid: Bool {
+        viewMode == .grid && Int(round(gridZoom)) < 3
+    }
+    
+    var canZoomOutGrid: Bool {
+        viewMode == .grid && Int(round(gridZoom)) > 1
+    }
+    
+    func zoomInGrid() {
+        gridZoom = min(3, round(gridZoom) + 1)
+    }
+    
+    func zoomOutGrid() {
+        gridZoom = max(1, round(gridZoom) - 1)
+    }
+    
+    func resetGridZoom() {
+        gridZoom = 2
+    }
+    
+    func openDownloadsFolderInFinder() {
+        guard let downloadsURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else {
+            return
+        }
+        NSWorkspace.shared.open(downloadsURL)
     }
     
     func itemsForDrag(startingWith primaryItem: MTPObjectItem) -> [MTPObjectItem] {
