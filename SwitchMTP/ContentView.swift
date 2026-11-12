@@ -148,9 +148,9 @@ private struct ToolbarFilterSortMenu: View {
             if viewModel.viewMode == .grid {
                 Divider()
                 Menu("Thumbnail Size") {
-                    Button("Small") { viewModel.gridZoom = 140 }
-                    Button("Medium") { viewModel.gridZoom = 175 }
-                    Button("Large") { viewModel.gridZoom = 230 }
+                    Button("Small") { viewModel.gridZoom = 1 }
+                    Button("Medium") { viewModel.gridZoom = 2 }
+                    Button("Large") { viewModel.gridZoom = 3 }
                 }
             }
 
@@ -269,58 +269,59 @@ private struct SidebarView: View {
     @State private var showDeviceInfo = false
 
     var body: some View {
-        List(selection: $viewModel.selectedSidebar) {
-            Section("Library") {
-                NavigationLink(value: SidebarDestination.allMedia) {
-                    Label("All Media", systemImage: "photo.on.rectangle")
-                        .badge(viewModel.allMediaItems.count)
-                }
-
-                NavigationLink(value: SidebarDestination.screenshots) {
-                    Label("Screenshots", systemImage: "camera.viewfinder")
-                        .badge(viewModel.hasLoadedAllMedia ? viewModel.allScreenshotsCount : 0)
-                }
-
-                NavigationLink(value: SidebarDestination.videos) {
-                    Label("Videos", systemImage: "video")
-                        .badge(viewModel.hasLoadedAllMedia ? viewModel.allVideosCount : 0)
-                }
-
-                if let primaryStorage = viewModel.storages.first {
-                    NavigationLink(value: SidebarDestination.storageRoot(primaryStorage.id)) {
-                        Label("All Games", systemImage: "square.grid.2x2")
-                            .badge(viewModel.rootFolders.count)
+        VStack(spacing: 0) {
+            List(selection: $viewModel.selectedSidebar) {
+                Section("Library") {
+                    NavigationLink(value: SidebarDestination.allMedia) {
+                        Label("All Media", systemImage: "photo.on.rectangle")
+                            .badge(viewModel.allMediaItems.count)
                     }
-                }
-            }
 
-            if !viewModel.rootFolders.isEmpty {
-                Section("Games") {
-                    ForEach(viewModel.rootFolders) { folder in
-                        NavigationLink(value: SidebarDestination.gameFolder(folder.handle)) {
-                            Label(folder.filename, systemImage: "folder")
-                                .lineLimit(1)
-                                .badge(folder.childCount ?? 0)
-                        }
-                        .contextMenu {
-                            Button {
-                                viewModel.quickSaveToDownloads([folder])
-                            } label: {
-                                Label("Save to Downloads", systemImage: "arrow.down.circle")
-                            }
+                    NavigationLink(value: SidebarDestination.screenshots) {
+                        Label("Screenshots", systemImage: "camera.viewfinder")
+                            .badge(viewModel.hasLoadedAllMedia ? viewModel.allScreenshotsCount : 0)
+                    }
 
-                            Button {
-                                viewModel.promptAndExportFolders([folder])
-                            } label: {
-                                Label("Export Folder…", systemImage: "folder")
-                            }
+                    NavigationLink(value: SidebarDestination.videos) {
+                        Label("Videos", systemImage: "video")
+                            .badge(viewModel.hasLoadedAllMedia ? viewModel.allVideosCount : 0)
+                    }
+
+                    if let primaryStorage = viewModel.storages.first {
+                        NavigationLink(value: SidebarDestination.storageRoot(primaryStorage.id)) {
+                            Label("All Games", systemImage: "square.grid.2x2")
+                                .badge(viewModel.rootFolders.count)
                         }
                     }
                 }
+
+                if !viewModel.rootFolders.isEmpty {
+                    Section("Games") {
+                        ForEach(viewModel.rootFolders) { folder in
+                            NavigationLink(value: SidebarDestination.gameFolder(folder.handle)) {
+                                Label(folder.filename, systemImage: "folder")
+                                    .lineLimit(1)
+                                    .badge(folder.childCount ?? 0)
+                            }
+                            .contextMenu {
+                                Button {
+                                    viewModel.quickSaveToDownloads([folder])
+                                } label: {
+                                    Label("Save to Downloads", systemImage: "arrow.down.circle")
+                                }
+
+                                Button {
+                                    viewModel.promptAndExportFolders([folder])
+                                } label: {
+                                    Label("Export Folder…", systemImage: "folder")
+                                }
+                            }
+                        }
+                    }
+                }
             }
-        }
-        .listStyle(.sidebar)
-        .safeAreaInset(edge: .bottom, spacing: 0) {
+            .listStyle(.sidebar)
+
             DeviceStatusFooter(viewModel: viewModel, showDeviceInfo: $showDeviceInfo)
         }
     }
@@ -329,72 +330,125 @@ private struct SidebarView: View {
 private struct DeviceStatusFooter: View {
     var viewModel: MTPViewModel
     @Binding var showDeviceInfo: Bool
+    @State private var isHovering = false
 
     var body: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 8, height: 8)
+        Button {
+            if viewModel.isConnected {
+                showDeviceInfo.toggle()
+            } else if !viewModel.isConnecting {
+                Task { await viewModel.connectToDevice() }
+            }
+        } label: {
+            HStack(spacing: 10) {
+                ZStack(alignment: .bottomTrailing) {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(viewModel.isConnected ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.06))
+                        .frame(width: 28, height: 28)
+                        .overlay {
+                            Image(systemName: "gamecontroller.fill")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(viewModel.isConnected ? Color.accentColor : .secondary)
+                        }
 
-            Text(statusText)
-                .font(.subheadline)
-                .foregroundStyle(viewModel.isConnected ? .primary : .secondary)
-                .lineLimit(1)
-
-            Spacer(minLength: 4)
-
-            if let details = viewModel.deviceDetails, viewModel.isConnected {
-                Button {
-                    showDeviceInfo.toggle()
-                } label: {
-                    Image(systemName: "info.circle")
-                        .foregroundStyle(.secondary)
+                    Circle()
+                        .fill(statusColor)
+                        .frame(width: 8, height: 8)
+                        .overlay {
+                            Circle()
+                                .strokeBorder(Color(nsColor: .windowBackgroundColor), lineWidth: 1.5)
+                        }
+                        .offset(x: 2, y: 2)
                 }
-                .buttonStyle(.plain)
-                .help("Device Details")
-                .popover(isPresented: $showDeviceInfo, arrowEdge: .top) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(details.displayName)
-                            .font(.headline)
 
-                        Text(viewModel.totalMediaCountSummary)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(statusTitle)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(viewModel.isConnected ? .primary : .secondary)
+                        .lineLimit(1)
 
-                        Divider()
+                    Text(statusSubtitle)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
 
-                        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
-                            if !details.deviceVersion.isEmpty {
-                                GridRow {
-                                    Text("Firmware")
-                                        .foregroundStyle(.secondary)
-                                    Text(details.deviceVersion)
-                                }
-                            }
-                            if !details.serialNumber.isEmpty {
-                                GridRow {
-                                    Text("Serial")
-                                        .foregroundStyle(.secondary)
-                                    Text(details.serialNumber)
-                                        .monospaced()
-                                }
-                            }
+                Spacer(minLength: 4)
+
+                if viewModel.isConnected {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 13, weight: .regular))
+                        .foregroundStyle(isHovering ? .primary : .secondary)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(.quaternary.opacity(isHovering ? 0.55 : 0.35))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(.primary.opacity(0.07), lineWidth: 0.5)
+                    }
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 10)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+        .onHover { hovering in
+            isHovering = hovering
+        }
+        .help(viewModel.isConnected ? "Show Nintendo Switch details" : "Connect to Nintendo Switch")
+        .popover(isPresented: $showDeviceInfo, arrowEdge: .top) {
+            if let details = viewModel.deviceDetails {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "gamecontroller.fill")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.green)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(details.displayName)
+                                .font(.headline)
+                            Text(viewModel.totalMediaCountSummary)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Divider()
+
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 5) {
+                        if !details.deviceVersion.isEmpty {
                             GridRow {
-                                Text("USB ID")
+                                Text("Firmware")
                                     .foregroundStyle(.secondary)
-                                Text(String(format: "%04X:%04X", details.vendorID, details.productID))
+                                Text(details.deviceVersion)
+                            }
+                        }
+                        if !details.serialNumber.isEmpty {
+                            GridRow {
+                                Text("Serial")
+                                    .foregroundStyle(.secondary)
+                                Text(details.serialNumber)
                                     .monospaced()
                             }
                         }
-                        .font(.caption)
+                        GridRow {
+                            Text("USB ID")
+                                .foregroundStyle(.secondary)
+                            Text(String(format: "%04X:%04X", details.vendorID, details.productID))
+                                .monospaced()
+                        }
                     }
-                    .padding(12)
-                    .frame(minWidth: 200)
+                    .font(.caption)
+                    .textSelection(.enabled)
                 }
+                .padding(14)
+                .frame(minWidth: 210)
             }
         }
-        .padding(.horizontal, 14)
-        .frame(height: 36)
     }
 
     private var statusColor: Color {
@@ -403,9 +457,16 @@ private struct DeviceStatusFooter: View {
         return .secondary.opacity(0.5)
     }
 
-    private var statusText: String {
+    private var statusTitle: String {
         if viewModel.isConnected {
             return viewModel.deviceDetails?.displayName ?? "Nintendo Switch"
+        }
+        return "Nintendo Switch"
+    }
+
+    private var statusSubtitle: String {
+        if viewModel.isConnected {
+            return "Connected"
         }
         if viewModel.isConnecting {
             return "Connecting…"
@@ -476,7 +537,6 @@ private struct MainBrowserPane: View {
             }
 
             if viewModel.isConnected {
-                Divider()
                 BottomStatusBar(viewModel: viewModel)
             }
         }
@@ -532,23 +592,33 @@ private struct MainBrowserPane: View {
 
 private struct MediaGridView: View {
     @Bindable var viewModel: MTPViewModel
+    @State private var containerWidth: CGFloat = 880
 
     var body: some View {
-        let columns = [
-            GridItem(.adaptive(minimum: viewModel.gridZoom, maximum: viewModel.gridZoom + 60), spacing: 16)
-        ]
+        let spacing: CGFloat = 16
+        let horizontalPadding: CGFloat = 20
+        let innerWidth = max(320, containerWidth - horizontalPadding * 2)
+        let zoomStep = max(0, min(4, Int(round(viewModel.gridZoom))))
+        let columnCount = max(2, 6 - zoomStep)
+        let itemWidth = max(80, floor((innerWidth - CGFloat(columnCount - 1) * spacing) / CGFloat(columnCount)))
+        let thumbHeight = floor(itemWidth * 9.0 / 16.0)
+        let columns = Array(
+            repeating: GridItem(.flexible(minimum: 80, maximum: .infinity), spacing: spacing, alignment: .top),
+            count: columnCount
+        )
         let showGameTag = viewModel.selectedSidebar == .allMedia
             || viewModel.selectedSidebar == .screenshots
             || viewModel.selectedSidebar == .videos
 
         ScrollView {
-            LazyVGrid(columns: columns, spacing: 16) {
+            LazyVGrid(columns: columns, alignment: .leading, spacing: spacing) {
                 ForEach(viewModel.filteredAndSortedItems) { item in
                     MediaGridCard(
                         item: item,
                         thumbnail: viewModel.thumbnails[item.handle],
                         isSelected: viewModel.selectedItemIDs.contains(item.handle),
                         showGameTag: showGameTag,
+                        thumbHeight: thumbHeight,
                         onPlay: { viewModel.openItem(item) }
                     )
                     .onAppear {
@@ -576,7 +646,15 @@ private struct MediaGridView: View {
                     }
                 }
             }
-            .padding(20)
+            .padding(horizontalPadding)
+            .animation(.snappy(duration: 0.2), value: columnCount)
+        }
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.width
+        } action: { newWidth in
+            if abs(newWidth - containerWidth) > 0.5 {
+                containerWidth = newWidth
+            }
         }
         .background(Color(nsColor: .textBackgroundColor))
         .onExitCommand {
@@ -590,6 +668,7 @@ private struct MediaGridCard: View {
     let thumbnail: NSImage?
     let isSelected: Bool
     let showGameTag: Bool
+    let thumbHeight: CGFloat
     let onPlay: () -> Void
 
     var body: some View {
@@ -597,7 +676,8 @@ private struct MediaGridCard: View {
             ZStack(alignment: .bottomTrailing) {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(Color.primary.opacity(0.05))
-                    .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: thumbHeight)
                     .overlay {
                         if item.isFolder {
                             Image(systemName: "folder.fill")
@@ -606,7 +686,9 @@ private struct MediaGridCard: View {
                         } else if let thumbnail {
                             Image(nsImage: thumbnail)
                                 .resizable()
-                                .aspectRatio(contentMode: .fit)
+                                .aspectRatio(contentMode: .fill)
+                                .frame(maxWidth: .infinity)
+                                .frame(height: thumbHeight)
                         } else {
                             Image(systemName: item.isVideo ? "video.fill" : "photo.fill")
                                 .font(.system(size: 24))
@@ -652,6 +734,7 @@ private struct MediaGridCard: View {
             }
             .padding(.horizontal, 2)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
     }
 
@@ -1004,6 +1087,7 @@ private struct InspectorPane: View {
                             .padding(.top, 6)
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
+                        .disclosureGroupStyle(ClickableHeaderDisclosureStyle())
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                     }
@@ -1015,6 +1099,40 @@ private struct InspectorPane: View {
                 } description: {
                     Text("Select an item to view its details.")
                 }
+            }
+        }
+    }
+}
+
+private struct ClickableHeaderDisclosureStyle: DisclosureGroupStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.snappy(duration: 0.18)) {
+                    configuration.isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(configuration.isExpanded ? 90 : 0))
+                        .frame(width: 12, height: 12)
+
+                    configuration.label
+                        .foregroundStyle(.secondary)
+
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 2)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if configuration.isExpanded {
+                configuration.content
+                    .foregroundStyle(.primary)
             }
         }
     }
@@ -1107,45 +1225,111 @@ private struct BottomStatusBar: View {
         HStack(spacing: 10) {
             if let transfer = viewModel.transferStatus {
                 ProgressView(value: transfer.fractionCompleted)
-                    .frame(width: 120)
+                    .controlSize(.small)
+                    .frame(width: 110)
+
                 Text("\(transfer.title) \(transfer.currentFile)")
-                    .font(.caption)
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+
+                if transfer.bytesPerSecond > 0 {
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(transfer.bytesPerSecond), countStyle: .file) + "/s")
+                        .font(.system(size: 11).monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
             } else if let banner = viewModel.statusBanner {
                 Image(systemName: "checkmark.circle.fill")
                     .foregroundStyle(.green)
-                    .font(.caption)
+                    .font(.system(size: 12))
                 Text(banner)
-                    .font(.caption)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.primary)
                     .lineLimit(1)
             } else {
-                Text(statusSummaryText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(statusSummaryText)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+
+                    if let sizeSummary = totalBytesSummaryText {
+                        Text("·")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.tertiary)
+                        Text(sizeSummary)
+                            .font(.system(size: 12).monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
+
+                    if !viewModel.selectedItemIDs.isEmpty {
+                        Button("Clear") {
+                            viewModel.selectedItemIDs.removeAll()
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
+                        .padding(.leading, 4)
+                    }
+                }
             }
 
-            Spacer()
+            Spacer(minLength: 8)
 
             if viewModel.viewMode == .grid {
                 HStack(spacing: 6) {
-                    Image(systemName: "photo")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                    Slider(value: $viewModel.gridZoom, in: 130...250)
+                    Button {
+                        withAnimation(.snappy(duration: 0.18)) {
+                            viewModel.gridZoom = max(0, round(viewModel.gridZoom) - 1)
+                        }
+                    } label: {
+                        Image(systemName: "minus.magnifyingglass")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(viewModel.gridZoom <= 0)
+                    .help("Smaller thumbnails")
+
+                    Slider(value: $viewModel.gridZoom, in: 0...4, step: 1)
                         .controlSize(.mini)
-                        .frame(width: 84)
+                        .tint(.secondary)
+                        .frame(width: 96)
                         .help("Adjust thumbnail size")
-                    Image(systemName: "photo")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
+
+                    Button {
+                        withAnimation(.snappy(duration: 0.18)) {
+                            viewModel.gridZoom = min(4, round(viewModel.gridZoom) + 1)
+                        }
+                    } label: {
+                        Image(systemName: "plus.magnifyingglass")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(viewModel.gridZoom >= 4)
+                    .help("Larger thumbnails")
                 }
             }
         }
-        .padding(.horizontal, 14)
-        .frame(height: 28)
-        .background(.bar)
+        .padding(.horizontal, 12)
+        .frame(height: 34)
+        .background {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.quaternary.opacity(0.35))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(.primary.opacity(0.07), lineWidth: 0.5)
+                }
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 4)
+        .padding(.bottom, 10)
     }
 
     private var statusSummaryText: String {
@@ -1155,6 +1339,18 @@ private struct BottomStatusBar: View {
             return "\(selCount) of \(count) selected"
         }
         return "\(count) item\(count == 1 ? "" : "s")"
+    }
+
+    private var totalBytesSummaryText: String? {
+        let itemsToSum: [MTPObjectItem]
+        if !viewModel.selectedItemIDs.isEmpty {
+            itemsToSum = viewModel.selectedItems.filter { !$0.isFolder }
+        } else {
+            itemsToSum = viewModel.filteredAndSortedItems.filter { !$0.isFolder }
+        }
+        let totalBytes = itemsToSum.reduce(Int64(0)) { $0 + Int64($1.compressedSize) }
+        guard totalBytes > 0 else { return nil }
+        return ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
     }
 }
 

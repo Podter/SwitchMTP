@@ -146,7 +146,7 @@ final class MTPViewModel {
         }
     }
     var viewMode: BrowserViewMode = .grid
-    var gridZoom: Double = 175
+    var gridZoom: Double = 2
     var showInspector: Bool = false
     
     var thumbnails: [UInt32: NSImage] = [:]
