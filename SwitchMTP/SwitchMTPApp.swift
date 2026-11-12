@@ -10,10 +10,11 @@ import SwiftUI
 @main
 struct SwitchMTPApp: App {
     var body: some Scene {
-        WindowGroup("SwitchMTP — Nintendo Switch MTP Explorer") {
+        WindowGroup("SwitchMTP") {
             ContentView()
-                .frame(minWidth: 900, minHeight: 560)
+                .frame(minWidth: 860, minHeight: 540)
         }
-        .defaultSize(width: 1200, height: 780)
+        .defaultSize(width: 1120, height: 740)
+        .windowToolbarStyle(.unified)
     }
 }

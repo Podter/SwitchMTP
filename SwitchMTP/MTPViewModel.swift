@@ -93,7 +93,7 @@ final class MTPViewModel {
     var storages: [MTPStorage] = []
     var rootFolders: [MTPObjectItem] = []
     
-    var selectedSidebar: SidebarDestination? = nil {
+    var selectedSidebar: SidebarDestination? = .allMedia {
         didSet {
             if oldValue != selectedSidebar {
                 handleSidebarSelectionChange()
@@ -117,8 +117,7 @@ final class MTPViewModel {
     var sortOrder: MediaSortOrder = .dateNewest
     var viewMode: BrowserViewMode = .grid
     var gridZoom: Double = 175
-    var organizeExportsByGame: Bool = true
-    var showInspector: Bool = true
+    var showInspector: Bool = false
     
     var thumbnails: [UInt32: NSImage] = [:]
     private var loadingThumbnails: Set<UInt32> = []
@@ -130,7 +129,16 @@ final class MTPViewModel {
     var previewImage: NSImage? = nil
     var previewVideoURL: URL? = nil
     var previewPlayer: AVPlayer? = nil
-    var fullScreenPreviewItem: MTPObjectItem? = nil
+    var fullScreenPreviewItem: MTPObjectItem? = nil {
+        didSet {
+            if let item = fullScreenPreviewItem {
+                loadPreview(for: item, forLightbox: true)
+            } else {
+                previewPlayer?.pause()
+                previewPlayer = nil
+            }
+        }
+    }
     
     // Transfer state
     var transferStatus: TransferStatus? = nil
@@ -186,17 +194,10 @@ final class MTPViewModel {
                 self.rootFolders = rootItems.filter(\.isFolder)
                 print("[SwitchMTP] Connected to \(details.displayName) (FW \(details.deviceVersion), SN \(details.serialNumber)) — \(self.rootFolders.count) game folders loaded")
                 
-                // Default to showing the Album root folders immediately (takes ~50ms)
                 if selectedSidebar == nil {
-                    selectedSidebar = .storageRoot(primaryStorage.id)
-                } else {
-                    await loadSelectedDestination()
+                    selectedSidebar = .allMedia
                 }
-                
-                // Select the first folder for immediate inspector preview
-                if selectedItemIDs.isEmpty, let firstFolder = self.rootFolders.first {
-                    selectedItemIDs = [firstFolder.handle]
-                }
+                await loadSelectedDestination()
             }
         } catch {
             print("[SwitchMTP] connectToDevice error: \(error.localizedDescription)")
@@ -205,7 +206,11 @@ final class MTPViewModel {
             self.storages = []
             self.rootFolders = []
             self.currentItems = []
-            self.errorMessage = error.localizedDescription
+            if case MTPError.deviceNotFound = error {
+                self.errorMessage = nil
+            } else {
+                self.errorMessage = error.localizedDescription
+            }
         }
         
         isConnecting = false
@@ -232,7 +237,7 @@ final class MTPViewModel {
         previewImage = nil
         previewVideoURL = nil
         previewPlayer = nil
-        errorMessage = "Nintendo Switch disconnected. Enable 'Copy to a Computer via USB Connection' on your Switch to reconnect."
+        errorMessage = nil
     }
     
     // MARK: - Navigation & Loading
@@ -522,7 +527,7 @@ final class MTPViewModel {
         loadPreview(for: item)
     }
     
-    func loadPreview(for item: MTPObjectItem) {
+    func loadPreview(for item: MTPObjectItem, forLightbox: Bool = false) {
         previewPlayer?.pause()
         previewPlayer = nil
         previewVideoURL = nil
@@ -535,6 +540,12 @@ final class MTPViewModel {
         
         // Show cached thumbnail immediately while full asset loads
         previewImage = thumbnails[item.handle]
+        if item.isVideo && !forLightbox && fullScreenPreviewItem?.handle != item.handle {
+            requestThumbnailIfNeeded(for: item)
+            isLoadingPreview = false
+            return
+        }
+        
         isLoadingPreview = true
         let handle = item.handle
         
@@ -542,7 +553,7 @@ final class MTPViewModel {
             do {
                 if item.isImage {
                     let data = try await client.fetchObjectData(handle: handle)
-                    guard self.inspectedItem?.handle == handle else { return }
+                    guard self.inspectedItem?.handle == handle || self.fullScreenPreviewItem?.handle == handle else { return }
                     if let fullImg = NSImage(data: data) {
                         self.previewImage = fullImg
                         if self.thumbnails[handle] == nil {
@@ -555,14 +566,14 @@ final class MTPViewModel {
                     if !FileManager.default.fileExists(atPath: tempURL.path) {
                         try await client.downloadObjectToFile(item: item, destinationURL: tempURL)
                     }
-                    guard self.inspectedItem?.handle == handle else { return }
+                    guard self.fullScreenPreviewItem?.handle == handle else { return }
                     self.previewVideoURL = tempURL
                     self.previewPlayer = AVPlayer(url: tempURL)
                 }
             } catch {
                 // Keep thumbnail fallback
             }
-            if self.inspectedItem?.handle == handle {
+            if self.inspectedItem?.handle == handle || self.fullScreenPreviewItem?.handle == handle {
                 self.isLoadingPreview = false
             }
         }
@@ -593,7 +604,7 @@ final class MTPViewModel {
                 let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("SwitchMTPQuickOpen", isDirectory: true)
                 let destURL = tempDir.appendingPathComponent(item.filename)
                 if !FileManager.default.fileExists(atPath: destURL.path) {
-                    try await exportItems([item], toDirectory: tempDir, organizeByGame: false, revealWhenDone: false)
+                    try await exportItems([item], toDirectory: tempDir, revealWhenDone: false)
                 }
                 NSWorkspace.shared.open(destURL)
             } catch {
@@ -607,9 +618,8 @@ final class MTPViewModel {
         guard let downloadsURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else {
             return
         }
-        let targetDir = downloadsURL.appendingPathComponent("Nintendo Switch Album", isDirectory: true)
         Task {
-            try? await exportItems(items, toDirectory: targetDir, organizeByGame: organizeExportsByGame, revealWhenDone: true)
+            try? await exportItems(items, toDirectory: downloadsURL, revealWhenDone: true)
         }
     }
     
@@ -625,7 +635,7 @@ final class MTPViewModel {
         
         if panel.runModal() == .OK, let destinationDir = panel.url {
             Task {
-                try? await exportItems(items, toDirectory: destinationDir, organizeByGame: organizeExportsByGame, revealWhenDone: true)
+                try? await exportItems(items, toDirectory: destinationDir, revealWhenDone: true)
             }
         }
     }
@@ -665,7 +675,7 @@ final class MTPViewModel {
                         filesToExport.append(contentsOf: fetched.filter { !$0.isFolder })
                     }
                 }
-                try? await exportItems(filesToExport, toDirectory: destinationDir, organizeByGame: true, revealWhenDone: true)
+                try? await exportItems(filesToExport, toDirectory: destinationDir, revealWhenDone: true)
             }
         }
     }
@@ -673,7 +683,6 @@ final class MTPViewModel {
     func exportItems(
         _ items: [MTPObjectItem],
         toDirectory baseDirectory: URL,
-        organizeByGame: Bool,
         revealWhenDone: Bool
     ) async throws {
         // Expand any folders included in items
@@ -704,12 +713,7 @@ final class MTPViewModel {
         var cumulativeBytes: Int64 = 0
         
         for (index, fileItem) in flatFiles.enumerated() {
-            var targetFolder = baseDirectory
-            if organizeByGame, !fileItem.folderName.isEmpty {
-                let sanitizedFolder = Self.sanitizeFilename(fileItem.folderName)
-                targetFolder = baseDirectory.appendingPathComponent(sanitizedFolder, isDirectory: true)
-            }
-            let fileURL = targetFolder.appendingPathComponent(Self.sanitizeFilename(fileItem.filename))
+            let fileURL = baseDirectory.appendingPathComponent(Self.sanitizeFilename(fileItem.filename))
             
             self.transferStatus = TransferStatus(
                 title: flatFiles.count == 1 ? "Exporting File…" : "Exporting \(index + 1) of \(flatFiles.count)…",

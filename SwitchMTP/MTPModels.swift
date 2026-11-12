@@ -198,7 +198,7 @@ nonisolated struct MTPObjectItem: Identifiable, Sendable, Equatable, Hashable {
     }
     
     var displayDate: Date? {
-        captureDate ?? modificationDate
+        captureDate ?? modificationDate ?? MTPDateParser.parseFromFilename(filename)
     }
 }
 
@@ -246,6 +246,13 @@ nonisolated enum MTPDateParser {
         return df
     }()
     
+    private static let formatterFilename: DateFormatter = {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.dateFormat = "yyyyMMddHHmmss"
+        return df
+    }()
+    
     static func parse(_ raw: String) -> Date? {
         guard !raw.isEmpty else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -256,5 +263,12 @@ nonisolated enum MTPDateParser {
             }
         }
         return formatterFractional.date(from: trimmed)
+    }
+    
+    static func parseFromFilename(_ filename: String) -> Date? {
+        guard filename.count >= 14 else { return nil }
+        let prefix = String(filename.prefix(14))
+        guard prefix.allSatisfy(\.isNumber) else { return nil }
+        return formatterFilename.date(from: prefix)
     }
 }
