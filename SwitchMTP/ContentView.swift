@@ -25,12 +25,11 @@ struct ContentView: View {
             InspectorPane(viewModel: viewModel)
                 .inspectorColumnWidth(min: 260, ideal: 290, max: 360)
         }
-        .navigationTitle(windowTitle)
-        .navigationSubtitle(windowSubtitle)
+        .navigationTitle("")
         .searchable(text: $viewModel.searchText, placement: .toolbar, prompt: "Search")
         .toolbar {
-            ToolbarItemGroup(placement: .navigation) {
-                if viewModel.breadcrumbs.count > 1 {
+            if viewModel.breadcrumbs.count > 1 {
+                ToolbarItem(placement: .navigation) {
                     Button {
                         let parentStep = viewModel.breadcrumbs[viewModel.breadcrumbs.count - 2]
                         if parentStep.id == 0xFFFFFFFF {
@@ -50,6 +49,32 @@ struct ContentView: View {
                     .help("Go back to \(viewModel.breadcrumbs[viewModel.breadcrumbs.count - 2].title)")
                 }
             }
+            
+            ToolbarItem(placement: .navigation) {
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(windowTitle)
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        
+                        if !windowSubtitle.isEmpty {
+                            Text(windowSubtitle)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                    
+                    if viewModel.isWorking {
+                        ProgressView()
+                            .controlSize(.small)
+                            .help("Loading media…")
+                    }
+                }
+                .padding(.horizontal, 4)
+            }
+            .sharedBackgroundVisibility(.hidden)
             
             ToolbarItemGroup(placement: .primaryAction) {
                 Picker("View", selection: $viewModel.viewMode) {

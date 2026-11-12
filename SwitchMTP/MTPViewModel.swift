@@ -143,6 +143,10 @@ final class MTPViewModel {
     // Transfer state
     var transferStatus: TransferStatus? = nil
     
+    var isWorking: Bool {
+        isConnecting || isLoadingDirectory || isScanningAllMedia || !loadingThumbnails.isEmpty || transferStatus != nil
+    }
+    
     private var usbMonitorTask: Task<Void, Never>? = nil
     
     init() {
@@ -218,6 +222,7 @@ final class MTPViewModel {
     
     func refresh() async {
         folderItemsCache.removeAll()
+        loadingThumbnails.removeAll()
         hasLoadedAllMedia = false
         allMediaItems.removeAll()
         await connectToDevice()
@@ -231,6 +236,7 @@ final class MTPViewModel {
         rootFolders = []
         currentItems = []
         allMediaItems = []
+        loadingThumbnails.removeAll()
         hasLoadedAllMedia = false
         selectedItemIDs.removeAll()
         inspectedItem = nil
@@ -322,8 +328,15 @@ final class MTPViewModel {
                 aggregated.append(contentsOf: items.filter { !$0.isFolder })
                 // Stream progressive results into view
                 self.allMediaItems = aggregated
-                if case .allMedia = selectedSidebar {
+                switch selectedSidebar {
+                case .allMedia:
                     self.currentItems = aggregated
+                case .screenshots:
+                    self.currentItems = aggregated.filter(\.isImage)
+                case .videos:
+                    self.currentItems = aggregated.filter(\.isVideo)
+                default:
+                    break
                 }
             } catch {
                 continue
