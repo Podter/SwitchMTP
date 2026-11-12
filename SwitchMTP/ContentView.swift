@@ -455,7 +455,7 @@ private struct MediaGridCard: View {
                         } else if let thumbnail {
                             Image(nsImage: thumbnail)
                                 .resizable()
-                                .aspectRatio(contentMode: .fill)
+                                .aspectRatio(contentMode: .fit)
                         } else {
                             ProgressView()
                                 .controlSize(.small)
@@ -539,13 +539,17 @@ private struct MediaTableView: View {
                     if item.isFolder {
                         Image(systemName: "folder.fill")
                             .foregroundStyle(.tint)
-                            .frame(width: 28, height: 18)
-                    } else if let thumb = viewModel.thumbnails[item.handle] {
-                        Image(nsImage: thumb)
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
                             .frame(width: 32, height: 18)
-                            .clipShape(RoundedRectangle(cornerRadius: 3))
+                    } else if let thumb = viewModel.thumbnails[item.handle] {
+                        RoundedRectangle(cornerRadius: 3, style: .continuous)
+                            .fill(Color.primary.opacity(0.05))
+                            .frame(width: 32, height: 18)
+                            .overlay {
+                                Image(nsImage: thumb)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fit)
+                            }
+                            .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
                     } else {
                         Image(systemName: item.isVideo ? "video.fill" : "photo.fill")
                             .foregroundStyle(.secondary)
@@ -691,41 +695,40 @@ private struct InspectorPane: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         // Media Preview Box
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(Color.primary.opacity(0.06))
-                                .aspectRatio(16.0 / 9.0, contentMode: .fit)
-                            
-                            if item.isFolder {
-                                Image(systemName: "folder.fill")
-                                    .font(.system(size: 44))
-                                    .foregroundStyle(.tint)
-                            } else if let preview = viewModel.previewImage ?? viewModel.thumbnails[item.handle] {
-                                Image(nsImage: preview)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fit)
-                                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                                    .overlay {
-                                        if item.isVideo {
-                                            Button {
-                                                viewModel.fullScreenPreviewItem = item
-                                            } label: {
-                                                Image(systemName: "play.circle.fill")
-                                                    .font(.system(size: 36))
-                                                    .foregroundStyle(.white)
-                                                    .shadow(radius: 4)
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.primary.opacity(0.06))
+                            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                            .overlay {
+                                if item.isFolder {
+                                    Image(systemName: "folder.fill")
+                                        .font(.system(size: 44))
+                                        .foregroundStyle(.tint)
+                                } else if let preview = viewModel.previewImage ?? viewModel.thumbnails[item.handle] {
+                                    Image(nsImage: preview)
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fit)
+                                        .overlay {
+                                            if item.isVideo {
+                                                Button {
+                                                    viewModel.fullScreenPreviewItem = item
+                                                } label: {
+                                                    Image(systemName: "play.circle.fill")
+                                                        .font(.system(size: 36))
+                                                        .foregroundStyle(.white)
+                                                        .shadow(radius: 4)
+                                                }
+                                                .buttonStyle(.plain)
                                             }
-                                            .buttonStyle(.plain)
                                         }
-                                    }
-                                    .onTapGesture(count: 2) {
-                                        viewModel.fullScreenPreviewItem = item
-                                    }
-                            } else {
-                                ProgressView()
-                                    .controlSize(.small)
+                                        .onTapGesture(count: 2) {
+                                            viewModel.fullScreenPreviewItem = item
+                                        }
+                                } else {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                }
                             }
-                        }
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                         
                         // Title & Subtitle
                         VStack(alignment: .leading, spacing: 2) {
@@ -1028,34 +1031,34 @@ private struct MediaLightboxSheet: View {
             
             Divider()
             
-            ZStack {
-                Color.black
-                
-                if item.isVideo {
-                    if let player = viewModel.previewPlayer {
-                        MacVideoPlayerView(player: player)
-                            .onAppear { player.play() }
-                    } else {
-                        if let thumb = viewModel.thumbnails[item.handle] {
-                            Image(nsImage: thumb)
-                                .resizable()
-                                .aspectRatio(contentMode: .fit)
-                                .opacity(0.4)
+            Color.black
+                .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                .overlay {
+                    if item.isVideo {
+                        if let player = viewModel.previewPlayer {
+                            MacVideoPlayerView(player: player)
+                                .onAppear { player.play() }
+                        } else {
+                            if let thumb = viewModel.thumbnails[item.handle] {
+                                Image(nsImage: thumb)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fit)
+                                    .opacity(0.4)
+                            }
+                            ProgressView()
+                                .controlSize(.large)
+                                .tint(.white)
                         }
+                    } else if let img = viewModel.previewImage ?? viewModel.thumbnails[item.handle] {
+                        Image(nsImage: img)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                    } else {
                         ProgressView()
-                            .controlSize(.large)
                             .tint(.white)
                     }
-                } else if let img = viewModel.previewImage ?? viewModel.thumbnails[item.handle] {
-                    Image(nsImage: img)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                } else {
-                    ProgressView()
-                        .tint(.white)
                 }
-            }
-            .frame(minWidth: 800, minHeight: 460)
+                .frame(minWidth: 800, minHeight: 450)
         }
         .onAppear {
             if viewModel.inspectedItem?.handle != item.handle {
@@ -1075,6 +1078,7 @@ struct MacVideoPlayerView: NSViewRepresentable {
     func makeNSView(context: Context) -> AVPlayerView {
         let view = AVPlayerView()
         view.controlsStyle = .inline
+        view.videoGravity = .resizeAspect
         view.player = player
         return view
     }
