@@ -11,7 +11,21 @@
     ],
   },
   "files": [
-    { "kind": "folder", "path": "SwitchMTP", "target-membership": [ "SwitchMTP" ] },
+    {
+      "kind": "folder",
+      "path": "SwitchMTP",
+      "target-membership": [
+        "SwitchMTP",
+      ],
+      "membership-exceptions": [
+        {
+          "target": "SwitchMTP",
+          "exclusions": [
+            "Info.plist",
+          ],
+        },
+      ],
+    },
     { "path": "AGENTS.md", "target-membership": [ "SwitchMTP/resources" ] },
     {
       "kind": "group",
@@ -53,6 +67,7 @@
         "ENABLE_RESOURCE_ACCESS_USB": "YES",
         "ENABLE_USER_SELECTED_FILES": "readonly",
         "GENERATE_INFOPLIST_FILE": "YES",
+        "INFOPLIST_FILE": "SwitchMTP/Info.plist",
         "INFOPLIST_KEY_CFBundleDisplayName": "SwitchMTP",
         "INFOPLIST_KEY_LSApplicationCategoryType": "public.app-category.utilities",
         "INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]": "YES",
