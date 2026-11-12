@@ -98,6 +98,8 @@ Agents modifying `MTPUSBClient.swift` or `MTPModels.swift` must preserve these h
 - **"Nintendo Switch disconnected" / Device Not Found**:
   - Verify the Switch is awake and on the **System Settings → Data Management → Manage Screenshots and Videos → Copy to a Computer via USB Connection** screen.
   - Check `MTPUSBClient.isSwitchPresentInRegistry()` to confirm macOS enumerates `idVendor == 0x057E` and `idProduct == 0x201D`.
+- **"`Could not claim USB MTP interface: Failed to create IOUSBHostInterface.`" / "`USB transfer error: Unable to send IO.`"**:
+  - macOS automatically spawns `ptpcamerad` / `PTPCamera` (or a background Xcode Preview instance) to claim `IOUSBHostInterface` exclusively when a Still Image (`bInterfaceClass = 0x06`) USB device is plugged in. Because Personal Team code signing cannot include the restricted `com.apple.vm.device-access` entitlement required for kernel-level `.deviceSeize`, `MTPUSBClient.releaseCompetingUSBHoldersIfNeeded()` inspects `kIOServicePlane` child user clients (`IOUserClientCreator`), terminates competing user-space holders, waits for the kernel `IOUSBHostDevice` / `IOUSBHostInterface` re-enumeration to settle before acquiring a fresh `io_service_t`, and calls `drainPendingBulkInSync()` to drain any unread Bulk IN packets left in the Switch's USB FIFO by `ptpcamerad`.
 - **`MTP device returned Invalid Transaction ID (0x2004)`**:
   - Ensure `transactionID` increments by 1 per command and that no two commands execute concurrently outside `usbQueue`.
 - **SF Symbols**:

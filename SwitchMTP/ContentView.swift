@@ -10,182 +10,58 @@ import AppKit
 import AVKit
 
 struct ContentView: View {
-    @State private var viewModel = MTPViewModel()
+    @State private var viewModel: MTPViewModel
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
-    
+
+    init(initialInspectorOpen: Bool = false) {
+        let vm = MTPViewModel()
+        vm.showInspector = initialInspectorOpen
+        _viewModel = State(initialValue: vm)
+    }
+
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarView(viewModel: viewModel)
-                .navigationSplitViewColumnWidth(min: 210, ideal: 240, max: 300)
+                .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 260)
         } detail: {
             MainBrowserPane(viewModel: viewModel)
-                .frame(minWidth: 500, maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .inspector(isPresented: $viewModel.showInspector) {
-            InspectorPane(viewModel: viewModel)
-                .inspectorColumnWidth(min: 260, ideal: 290, max: 360)
-        }
-        .navigationTitle("")
-        .searchable(text: $viewModel.searchText, placement: .toolbar, prompt: "Search")
-        .toolbar {
-            if viewModel.breadcrumbs.count > 1 {
-                ToolbarItem(placement: .navigation) {
-                    Button {
-                        let parentStep = viewModel.breadcrumbs[viewModel.breadcrumbs.count - 2]
-                        if parentStep.id == 0xFFFFFFFF {
-                            viewModel.selectedSidebar = .storageRoot(parentStep.storageID)
-                        } else {
-                            Task {
-                                await viewModel.navigateToDirectory(
-                                    storageID: parentStep.storageID,
-                                    parentHandle: parentStep.id,
-                                    title: parentStep.title
-                                )
-                            }
-                        }
-                    } label: {
-                        Label("Back", systemImage: "chevron.left")
-                    }
-                    .help("Go back to \(viewModel.breadcrumbs[viewModel.breadcrumbs.count - 2].title)")
+                .frame(minWidth: viewModel.showInspector ? 420 : 660, minHeight: 540)
+                .navigationSplitViewColumnWidth(min: 420, ideal: 680)
+                .sheet(item: $viewModel.fullScreenPreviewItem) { item in
+                    MediaLightboxSheet(viewModel: viewModel, item: item)
                 }
-            }
-            
-            ToolbarItem(placement: .navigation) {
-                HStack(spacing: 8) {
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text(windowTitle)
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                        
-                        if !windowSubtitle.isEmpty {
-                            Text(windowSubtitle)
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                    }
-                    
-                    if viewModel.isWorking {
-                        ProgressView()
-                            .controlSize(.small)
-                            .help("Loading media…")
-                    }
+                .inspector(isPresented: $viewModel.showInspector) {
+                    InspectorPane(viewModel: viewModel)
+                        .inspectorColumnWidth(min: 240, ideal: 265, max: 320)
                 }
-                .padding(.horizontal, 4)
-            }
-            .sharedBackgroundVisibility(.hidden)
-            
-            ToolbarItemGroup(placement: .primaryAction) {
-                Picker("View", selection: $viewModel.viewMode) {
-                    Label("Icons", systemImage: "square.grid.2x2").tag(BrowserViewMode.grid)
-                    Label("List", systemImage: "list.bullet").tag(BrowserViewMode.table)
-                }
-                .pickerStyle(.segmented)
-                .help("Change how items are shown")
-                
-                Menu {
-                    Picker("Filter", selection: $viewModel.mediaFilter) {
-                        ForEach(MediaTypeFilter.allCases) { filter in
-                            Text(filter.rawValue).tag(filter)
-                        }
-                    }
-                    .pickerStyle(.inline)
-                    
-                    Divider()
-                    
-                    Picker("Sort By", selection: $viewModel.sortOrder) {
-                        ForEach(MediaSortOrder.allCases) { order in
-                            Text(order.rawValue).tag(order)
-                        }
-                    }
-                    .pickerStyle(.inline)
-                    
-                    if viewModel.viewMode == .grid {
-                        Divider()
-                        Menu("Thumbnail Size") {
-                            Button("Small") { viewModel.gridZoom = 140 }
-                            Button("Medium") { viewModel.gridZoom = 180 }
-                            Button("Large") { viewModel.gridZoom = 240 }
-                        }
-                    }
-                    
-                    Divider()
-                    
-                    Button {
-                        Task { await viewModel.refresh() }
-                    } label: {
-                        Label("Reload Device", systemImage: "arrow.clockwise")
-                    }
-                    .disabled(viewModel.isConnecting)
-                } label: {
-                    Label(
-                        viewModel.mediaFilter == .all ? "Filter & Sort" : viewModel.mediaFilter.rawValue,
-                        systemImage: viewModel.mediaFilter == .all
-                            ? "line.3.horizontal.decrease.circle"
-                            : "line.3.horizontal.decrease.circle.fill"
-                    )
-                }
-                .help("Filter, sort, and view options")
-                
-                Menu {
-                    Button {
-                        if !viewModel.selectedItems.isEmpty {
-                            viewModel.quickSaveToDownloads(viewModel.selectedItems)
-                        } else {
-                            let visibleMedia = viewModel.filteredAndSortedItems.filter { !$0.isFolder }
-                            viewModel.quickSaveToDownloads(visibleMedia)
-                        }
-                    } label: {
-                        Label(
-                            viewModel.selectedItems.isEmpty ? "Save All to Downloads" : "Save (\(viewModel.selectedItems.count)) to Downloads",
-                            systemImage: "arrow.down.circle"
-                        )
-                    }
-                    
-                    Button {
-                        if !viewModel.selectedItems.isEmpty {
-                            viewModel.promptAndExportItems(viewModel.selectedItems)
-                        } else {
-                            viewModel.promptAndExportAllVisible()
-                        }
-                    } label: {
-                        Label(
-                            viewModel.selectedItems.isEmpty ? "Export All to Folder…" : "Export (\(viewModel.selectedItems.count)) to Folder…",
-                            systemImage: "folder"
-                        )
-                    }
-                } label: {
-                    Label(
-                        viewModel.selectedItems.isEmpty ? "Save All" : "Save (\(viewModel.selectedItems.count))",
-                        systemImage: "arrow.down.circle"
-                    )
-                }
-                .disabled(!viewModel.isConnected || viewModel.filteredAndSortedItems.isEmpty)
-                .help("Save to Downloads or export to a folder")
-                
-                Button {
-                    viewModel.showInspector.toggle()
-                } label: {
-                    Label("Info", systemImage: viewModel.showInspector ? "info.circle.fill" : "info.circle")
-                }
-                .help("Show or hide item info")
-            }
-        }
-        .sheet(item: $viewModel.fullScreenPreviewItem) { item in
-            MediaLightboxSheet(viewModel: viewModel, item: item)
+                .navigationTitle(windowTitle)
+                .navigationSubtitle(windowSubtitle)
         }
     }
-    
+
     private var windowTitle: String {
         if let lastCrumb = viewModel.breadcrumbs.last {
             return lastCrumb.title
         }
+        if let selected = viewModel.selectedSidebar {
+            switch selected {
+            case .allMedia:
+                return "All Media"
+            case .screenshots:
+                return "Screenshots"
+            case .videos:
+                return "Videos"
+            case .storageRoot:
+                return "All Games"
+            case .gameFolder:
+                break
+            }
+        }
         return viewModel.deviceDetails?.displayName ?? "SwitchMTP"
     }
-    
+
     private var windowSubtitle: String {
-        guard viewModel.isConnected else { return "" }
+        guard viewModel.isConnected else { return "Not Connected" }
         let count = viewModel.filteredAndSortedItems.count
         let selCount = viewModel.selectedItemIDs.count
         if selCount > 0 {
@@ -195,30 +71,221 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Toolbar Subviews (Isolated Observation Scopes)
+
+private struct ToolbarBackButton: View {
+    var viewModel: MTPViewModel
+
+    var body: some View {
+        Button {
+            viewModel.navigateBack()
+        } label: {
+            Label("Back", systemImage: "chevron.left")
+        }
+        .disabled(!viewModel.canGoBack)
+        .help(backHelpText)
+    }
+
+    private var backHelpText: String {
+        guard viewModel.breadcrumbs.count > 1 else {
+            return "Go Back"
+        }
+        return "Go back to \(viewModel.breadcrumbs[viewModel.breadcrumbs.count - 2].title)"
+    }
+}
+
+private struct ToolbarLoadingIndicator: View {
+    var viewModel: MTPViewModel
+
+    var body: some View {
+        ZStack {
+            if viewModel.isWorking {
+                ProgressView()
+                    .controlSize(.small)
+                    .help("Loading media from Nintendo Switch…")
+            }
+        }
+        .frame(width: 20, height: 20)
+    }
+}
+
+private struct ToolbarViewModePicker: View {
+    @Bindable var viewModel: MTPViewModel
+
+    var body: some View {
+        Picker("View", selection: $viewModel.viewMode) {
+            Label("Icons", systemImage: "square.grid.2x2")
+                .tag(BrowserViewMode.grid)
+            Label("List", systemImage: "list.bullet")
+                .tag(BrowserViewMode.table)
+        }
+        .pickerStyle(.segmented)
+        .help("Change how items are shown")
+    }
+}
+
+private struct ToolbarFilterSortMenu: View {
+    @Bindable var viewModel: MTPViewModel
+
+    var body: some View {
+        Menu {
+            Picker("Filter", selection: $viewModel.mediaFilter) {
+                ForEach(MediaTypeFilter.allCases) { filter in
+                    Text(filter.rawValue).tag(filter)
+                }
+            }
+            .pickerStyle(.inline)
+
+            Divider()
+
+            Picker("Sort By", selection: $viewModel.sortOrder) {
+                ForEach(MediaSortOrder.allCases) { order in
+                    Text(order.rawValue).tag(order)
+                }
+            }
+            .pickerStyle(.inline)
+
+            if viewModel.viewMode == .grid {
+                Divider()
+                Menu("Thumbnail Size") {
+                    Button("Small") { viewModel.gridZoom = 140 }
+                    Button("Medium") { viewModel.gridZoom = 175 }
+                    Button("Large") { viewModel.gridZoom = 230 }
+                }
+            }
+
+            Divider()
+
+            Button {
+                Task { await viewModel.refresh() }
+            } label: {
+                Label("Reload Device", systemImage: "arrow.clockwise")
+            }
+            .keyboardShortcut("r", modifiers: .command)
+            .disabled(viewModel.isConnecting)
+        } label: {
+            Label("Filter & Sort", systemImage: "line.3.horizontal.decrease.circle")
+        }
+        .help("Filter, sort, and view options")
+    }
+}
+
+private struct ToolbarExportMenu: View {
+    var viewModel: MTPViewModel
+
+    var body: some View {
+        let selectedCount = viewModel.selectedItemIDs.count
+        let hasItems = !viewModel.filteredAndSortedItems.isEmpty
+
+        Menu {
+            Button {
+                if !viewModel.selectedItems.isEmpty {
+                    viewModel.quickSaveToDownloads(viewModel.selectedItems)
+                } else {
+                    let visibleMedia = viewModel.filteredAndSortedItems.filter { !$0.isFolder }
+                    viewModel.quickSaveToDownloads(visibleMedia)
+                }
+            } label: {
+                Label(
+                    selectedCount == 0
+                        ? "Save All to Downloads"
+                        : "Save \(selectedCount) Selected to Downloads",
+                    systemImage: "arrow.down.circle"
+                )
+            }
+
+            Button {
+                if !viewModel.selectedItems.isEmpty {
+                    viewModel.promptAndExportItems(viewModel.selectedItems)
+                } else {
+                    viewModel.promptAndExportAllVisible()
+                }
+            } label: {
+                Label(
+                    selectedCount == 0
+                        ? "Export All to Folder…"
+                        : "Export \(selectedCount) Selected to Folder…",
+                    systemImage: "folder"
+                )
+            }
+        } label: {
+            Label("Export", systemImage: "arrow.down.circle")
+        }
+        .disabled(!viewModel.isConnected || !hasItems)
+        .help("Save to Downloads or export to a folder")
+    }
+}
+
+private struct ToolbarInspectorButton: View {
+    var viewModel: MTPViewModel
+
+    var body: some View {
+        Button {
+            viewModel.showInspector.toggle()
+        } label: {
+            Label("Inspector", systemImage: "sidebar.trailing")
+        }
+        .keyboardShortcut("i", modifiers: .command)
+        .help("Show or hide Inspector (⌘I)")
+    }
+}
+
+private struct ToolbarSearchField: View {
+    @Bindable var viewModel: MTPViewModel
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+
+            TextField("Search", text: $viewModel.searchText)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13))
+                .focused($isFocused)
+
+            if !viewModel.searchText.isEmpty {
+                Button {
+                    viewModel.searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear search")
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(width: 168, height: 28)
+    }
+}
+
 // MARK: - Sidebar
 
 private struct SidebarView: View {
     @Bindable var viewModel: MTPViewModel
     @State private var showDeviceInfo = false
-    
+
     var body: some View {
         List(selection: $viewModel.selectedSidebar) {
             Section("Library") {
                 NavigationLink(value: SidebarDestination.allMedia) {
                     Label("All Media", systemImage: "photo.on.rectangle")
-                        .badge(viewModel.allMediaItems.isEmpty ? 0 : viewModel.allMediaItems.count)
+                        .badge(viewModel.allMediaItems.count)
                 }
-                
+
                 NavigationLink(value: SidebarDestination.screenshots) {
                     Label("Screenshots", systemImage: "camera.viewfinder")
-                        .badge(viewModel.hasLoadedAllMedia ? viewModel.allMediaItems.filter(\.isImage).count : 0)
+                        .badge(viewModel.hasLoadedAllMedia ? viewModel.allScreenshotsCount : 0)
                 }
-                
+
                 NavigationLink(value: SidebarDestination.videos) {
                     Label("Videos", systemImage: "video")
-                        .badge(viewModel.hasLoadedAllMedia ? viewModel.allMediaItems.filter(\.isVideo).count : 0)
+                        .badge(viewModel.hasLoadedAllMedia ? viewModel.allVideosCount : 0)
                 }
-                
+
                 if let primaryStorage = viewModel.storages.first {
                     NavigationLink(value: SidebarDestination.storageRoot(primaryStorage.id)) {
                         Label("All Games", systemImage: "square.grid.2x2")
@@ -226,7 +293,7 @@ private struct SidebarView: View {
                     }
                 }
             }
-            
+
             if !viewModel.rootFolders.isEmpty {
                 Section("Games") {
                     ForEach(viewModel.rootFolders) { folder in
@@ -241,7 +308,7 @@ private struct SidebarView: View {
                             } label: {
                                 Label("Save to Downloads", systemImage: "arrow.down.circle")
                             }
-                            
+
                             Button {
                                 viewModel.promptAndExportFolders([folder])
                             } label: {
@@ -253,7 +320,7 @@ private struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
-        .safeAreaInset(edge: .bottom) {
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             DeviceStatusFooter(viewModel: viewModel, showDeviceInfo: $showDeviceInfo)
         }
     }
@@ -262,80 +329,88 @@ private struct SidebarView: View {
 private struct DeviceStatusFooter: View {
     var viewModel: MTPViewModel
     @Binding var showDeviceInfo: Bool
-    
+
     var body: some View {
-        VStack(spacing: 0) {
-            Divider()
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(viewModel.isConnected ? Color.green : (viewModel.isConnecting ? Color.orange : Color.secondary.opacity(0.5)))
-                    .frame(width: 8, height: 8)
-                
-                Text(viewModel.isConnected ? (viewModel.deviceDetails?.displayName ?? "Nintendo Switch") : (viewModel.isConnecting ? "Connecting…" : "Not Connected"))
-                    .font(.subheadline)
-                    .foregroundStyle(viewModel.isConnected ? .primary : .secondary)
-                    .lineLimit(1)
-                
-                Spacer()
-                
-                if viewModel.isScanningAllMedia {
-                    ProgressView()
-                        .controlSize(.small)
-                        .help("Indexing media…")
-                } else if let details = viewModel.deviceDetails, viewModel.isConnected {
-                    Button {
-                        showDeviceInfo.toggle()
-                    } label: {
-                        Image(systemName: "info.circle")
+        HStack(spacing: 8) {
+            Circle()
+                .fill(statusColor)
+                .frame(width: 8, height: 8)
+
+            Text(statusText)
+                .font(.subheadline)
+                .foregroundStyle(viewModel.isConnected ? .primary : .secondary)
+                .lineLimit(1)
+
+            Spacer(minLength: 4)
+
+            if let details = viewModel.deviceDetails, viewModel.isConnected {
+                Button {
+                    showDeviceInfo.toggle()
+                } label: {
+                    Image(systemName: "info.circle")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Device Details")
+                .popover(isPresented: $showDeviceInfo, arrowEdge: .top) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(details.displayName)
+                            .font(.headline)
+
+                        Text(viewModel.totalMediaCountSummary)
+                            .font(.caption)
                             .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Device Details")
-                    .popover(isPresented: $showDeviceInfo, arrowEdge: .top) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(details.displayName)
-                                .font(.headline)
-                            
-                            Text(viewModel.totalMediaCountSummary)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            
-                            Divider()
-                            
-                            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
-                                if !details.deviceVersion.isEmpty {
-                                    GridRow {
-                                        Text("Firmware")
-                                            .foregroundStyle(.secondary)
-                                        Text(details.deviceVersion)
-                                    }
-                                }
-                                if !details.serialNumber.isEmpty {
-                                    GridRow {
-                                        Text("Serial")
-                                            .foregroundStyle(.secondary)
-                                        Text(details.serialNumber)
-                                            .monospaced()
-                                    }
-                                }
+
+                        Divider()
+
+                        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+                            if !details.deviceVersion.isEmpty {
                                 GridRow {
-                                    Text("USB ID")
+                                    Text("Firmware")
                                         .foregroundStyle(.secondary)
-                                    Text(String(format: "%04X:%04X", details.vendorID, details.productID))
+                                    Text(details.deviceVersion)
+                                }
+                            }
+                            if !details.serialNumber.isEmpty {
+                                GridRow {
+                                    Text("Serial")
+                                        .foregroundStyle(.secondary)
+                                    Text(details.serialNumber)
                                         .monospaced()
                                 }
                             }
-                            .font(.caption)
+                            GridRow {
+                                Text("USB ID")
+                                    .foregroundStyle(.secondary)
+                                Text(String(format: "%04X:%04X", details.vendorID, details.productID))
+                                    .monospaced()
+                            }
                         }
-                        .padding(12)
-                        .frame(minWidth: 200)
+                        .font(.caption)
                     }
+                    .padding(12)
+                    .frame(minWidth: 200)
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
         }
-        .background(.bar)
+        .padding(.horizontal, 14)
+        .frame(height: 36)
+    }
+
+    private var statusColor: Color {
+        if viewModel.isConnected { return .green }
+        if viewModel.isConnecting { return .orange }
+        return .secondary.opacity(0.5)
+    }
+
+    private var statusText: String {
+        if viewModel.isConnected {
+            return viewModel.deviceDetails?.displayName ?? "Nintendo Switch"
+        }
+        if viewModel.isConnecting {
+            return "Connecting…"
+        }
+        return "Not Connected"
     }
 }
 
@@ -343,7 +418,7 @@ private struct DeviceStatusFooter: View {
 
 private struct MainBrowserPane: View {
     @Bindable var viewModel: MTPViewModel
-    
+
     var body: some View {
         VStack(spacing: 0) {
             ZStack {
@@ -379,7 +454,7 @@ private struct MainBrowserPane: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            
+
             if let errorMessage = viewModel.errorMessage, viewModel.isConnected {
                 Divider()
                 HStack(spacing: 8) {
@@ -399,11 +474,56 @@ private struct MainBrowserPane: View {
                 .padding(.vertical, 8)
                 .background(.bar)
             }
-            
-            if viewModel.transferStatus != nil || viewModel.statusBanner != nil {
+
+            if viewModel.isConnected {
                 Divider()
                 BottomStatusBar(viewModel: viewModel)
             }
+        }
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                ToolbarBackButton(viewModel: viewModel)
+            }
+            .visibilityPriority(.high)
+
+            ToolbarItem(placement: .primaryAction) {
+                ToolbarLoadingIndicator(viewModel: viewModel)
+            }
+            .sharedBackgroundVisibility(.hidden)
+            .visibilityPriority(.high)
+
+            ToolbarItem(placement: .primaryAction) {
+                ToolbarViewModePicker(viewModel: viewModel)
+            }
+            .visibilityPriority(.high)
+
+            ToolbarSpacer(.fixed, placement: .primaryAction)
+
+            ToolbarItem(placement: .primaryAction) {
+                ToolbarFilterSortMenu(viewModel: viewModel)
+            }
+            .visibilityPriority(.high)
+
+            ToolbarSpacer(.fixed, placement: .primaryAction)
+
+            ToolbarItem(placement: .primaryAction) {
+                ToolbarExportMenu(viewModel: viewModel)
+            }
+            .visibilityPriority(.high)
+
+            ToolbarSpacer(.fixed, placement: .primaryAction)
+
+            ToolbarItem(placement: .primaryAction) {
+                ToolbarSearchField(viewModel: viewModel)
+            }
+            .visibilityPriority(.high)
+
+            ToolbarSpacer(.fixed, placement: .primaryAction)
+
+            ToolbarItem(placement: .primaryAction) {
+                ToolbarInspectorButton(viewModel: viewModel)
+            }
+            .visibilityPriority(.high)
         }
     }
 }
@@ -412,12 +532,15 @@ private struct MainBrowserPane: View {
 
 private struct MediaGridView: View {
     @Bindable var viewModel: MTPViewModel
-    
+
     var body: some View {
         let columns = [
             GridItem(.adaptive(minimum: viewModel.gridZoom, maximum: viewModel.gridZoom + 60), spacing: 16)
         ]
-        
+        let showGameTag = viewModel.selectedSidebar == .allMedia
+            || viewModel.selectedSidebar == .screenshots
+            || viewModel.selectedSidebar == .videos
+
         ScrollView {
             LazyVGrid(columns: columns, spacing: 16) {
                 ForEach(viewModel.filteredAndSortedItems) { item in
@@ -425,7 +548,7 @@ private struct MediaGridView: View {
                         item: item,
                         thumbnail: viewModel.thumbnails[item.handle],
                         isSelected: viewModel.selectedItemIDs.contains(item.handle),
-                        showGameTag: viewModel.selectedSidebar == .allMedia || viewModel.selectedSidebar == .screenshots || viewModel.selectedSidebar == .videos,
+                        showGameTag: showGameTag,
                         onPlay: { viewModel.openItem(item) }
                     )
                     .onAppear {
@@ -456,6 +579,9 @@ private struct MediaGridView: View {
             .padding(20)
         }
         .background(Color(nsColor: .textBackgroundColor))
+        .onExitCommand {
+            viewModel.clearSelection()
+        }
     }
 }
 
@@ -465,7 +591,7 @@ private struct MediaGridCard: View {
     let isSelected: Bool
     let showGameTag: Bool
     let onPlay: () -> Void
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             ZStack(alignment: .bottomTrailing) {
@@ -475,23 +601,27 @@ private struct MediaGridCard: View {
                     .overlay {
                         if item.isFolder {
                             Image(systemName: "folder.fill")
-                                .font(.system(size: 40))
+                                .font(.system(size: 38))
                                 .foregroundStyle(.tint)
                         } else if let thumbnail {
                             Image(nsImage: thumbnail)
                                 .resizable()
                                 .aspectRatio(contentMode: .fit)
                         } else {
-                            ProgressView()
-                                .controlSize(.small)
+                            Image(systemName: item.isVideo ? "video.fill" : "photo.fill")
+                                .font(.system(size: 24))
+                                .foregroundStyle(.quaternary)
                         }
                     }
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     .overlay(
                         RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .strokeBorder(isSelected ? Color.accentColor : Color.primary.opacity(0.08), lineWidth: isSelected ? 3 : 1)
+                            .strokeBorder(
+                                isSelected ? Color.accentColor : Color.primary.opacity(0.08),
+                                lineWidth: isSelected ? 3 : 1
+                            )
                     )
-                
+
                 if item.isVideo {
                     Button(action: onPlay) {
                         Image(systemName: "play.fill")
@@ -506,7 +636,7 @@ private struct MediaGridCard: View {
                     .help("Play Video")
                 }
             }
-            
+
             VStack(alignment: .leading, spacing: 1) {
                 Text(primaryLabel)
                     .font(.subheadline)
@@ -514,7 +644,7 @@ private struct MediaGridCard: View {
                     .foregroundStyle(isSelected ? Color.accentColor : .primary)
                     .lineLimit(1)
                     .truncationMode(.tail)
-                
+
                 Text(secondaryLabel)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -524,7 +654,7 @@ private struct MediaGridCard: View {
         }
         .contentShape(Rectangle())
     }
-    
+
     private var primaryLabel: String {
         if item.isFolder {
             return item.filename
@@ -532,12 +662,12 @@ private struct MediaGridCard: View {
         if showGameTag && !item.folderName.isEmpty {
             return item.folderName
         }
-        if let date = item.displayDate {
-            return date.formatted(date: .abbreviated, time: .shortened)
+        if !item.formattedDate.isEmpty {
+            return item.formattedDate
         }
         return item.filename
     }
-    
+
     private var secondaryLabel: String {
         if item.isFolder {
             if let count = item.childCount {
@@ -545,8 +675,8 @@ private struct MediaGridCard: View {
             }
             return "Folder"
         }
-        if showGameTag, let date = item.displayDate {
-            return date.formatted(date: .abbreviated, time: .shortened)
+        if showGameTag && !item.formattedDate.isEmpty {
+            return item.formattedDate
         }
         return item.formattedSize
     }
@@ -556,7 +686,7 @@ private struct MediaGridCard: View {
 
 private struct MediaTableView: View {
     @Bindable var viewModel: MTPViewModel
-    
+
     var body: some View {
         Table(viewModel.filteredAndSortedItems, selection: $viewModel.selectedItemIDs) {
             TableColumn("Name") { item in
@@ -589,17 +719,17 @@ private struct MediaTableView: View {
                 }
             }
             .width(min: 180, ideal: 260)
-            
+
             TableColumn("Game") { item in
                 Text(item.isFolder ? "—" : (item.folderName.isEmpty ? "—" : item.folderName))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             .width(min: 120, ideal: 180)
-            
+
             TableColumn("Date") { item in
-                if let date = item.displayDate {
-                    Text(date, format: .dateTime.year().month(.abbreviated).day().hour().minute())
+                if !item.formattedDate.isEmpty {
+                    Text(item.formattedDate)
                         .foregroundStyle(.secondary)
                 } else {
                     Text("—")
@@ -607,13 +737,13 @@ private struct MediaTableView: View {
                 }
             }
             .width(min: 120, ideal: 150)
-            
+
             TableColumn("Kind") { item in
                 Text(item.kindDescription)
                     .foregroundStyle(.secondary)
             }
             .width(min: 80, ideal: 110)
-            
+
             TableColumn("Size") { item in
                 Text(item.formattedSize)
                     .monospacedDigit()
@@ -649,7 +779,7 @@ private struct MediaTableView: View {
 private struct ItemContextMenu: View {
     var viewModel: MTPViewModel
     let item: MTPObjectItem
-    
+
     var body: some View {
         if item.isFolder {
             Button {
@@ -713,13 +843,12 @@ private struct ItemContextMenu: View {
 private struct InspectorPane: View {
     @Bindable var viewModel: MTPViewModel
     @State private var showTechnicalDetails = false
-    
+
     var body: some View {
         Group {
             if let item = viewModel.inspectedItem {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
-                        // Media Preview Box
                         RoundedRectangle(cornerRadius: 8, style: .continuous)
                             .fill(Color.primary.opacity(0.06))
                             .aspectRatio(16.0 / 9.0, contentMode: .fit)
@@ -749,25 +878,24 @@ private struct InspectorPane: View {
                                             viewModel.fullScreenPreviewItem = item
                                         }
                                 } else {
-                                    ProgressView()
-                                        .controlSize(.small)
+                                    Image(systemName: item.isVideo ? "video.fill" : "photo.fill")
+                                        .font(.system(size: 28))
+                                        .foregroundStyle(.quaternary)
                                 }
                             }
                             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        
-                        // Title & Subtitle
+
                         VStack(alignment: .leading, spacing: 2) {
                             Text(item.isFolder ? item.filename : (item.folderName.isEmpty ? item.filename : item.folderName))
                                 .font(.headline)
                                 .textSelection(.enabled)
-                            
+
                             Text(item.isFolder ? item.formattedSize : item.filename)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)
                         }
-                        
-                        // Primary Actions
+
                         HStack(spacing: 8) {
                             Button {
                                 viewModel.quickSaveToDownloads([item])
@@ -776,7 +904,7 @@ private struct InspectorPane: View {
                                     .frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.borderedProminent)
-                            
+
                             Button {
                                 if item.isFolder {
                                     viewModel.promptAndExportFolders([item])
@@ -787,7 +915,7 @@ private struct InspectorPane: View {
                                 Text("Export…")
                                     .frame(maxWidth: .infinity)
                             }
-                            
+
                             if item.isImage {
                                 Button {
                                     viewModel.copyImageToClipboard(item)
@@ -797,11 +925,18 @@ private struct InspectorPane: View {
                                 .help("Copy Image")
                             }
                         }
-                        
+
                         Divider()
-                        
-                        // Standard Info
+
                         Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 8) {
+                            if !item.isFolder && !item.folderName.isEmpty {
+                                GridRow {
+                                    Text("Game")
+                                        .foregroundStyle(.secondary)
+                                    Text(item.folderName)
+                                        .lineLimit(2)
+                                }
+                            }
                             GridRow {
                                 Text("Kind")
                                     .foregroundStyle(.secondary)
@@ -819,76 +954,58 @@ private struct InspectorPane: View {
                                     Text(item.dimensionsDescription)
                                 }
                             }
-                            if let date = item.displayDate {
+                            if !item.formattedDate.isEmpty {
                                 GridRow {
                                     Text("Created")
                                         .foregroundStyle(.secondary)
-                                    Text(date.formatted(date: .abbreviated, time: .shortened))
+                                    Text(item.formattedDate)
                                 }
                             }
                         }
                         .font(.subheadline)
-                        
+
                         Divider()
-                        
-                        // Hidden Technical Details
-                        VStack(alignment: .leading, spacing: 8) {
-                            Button {
-                                withAnimation(.easeInOut(duration: 0.15)) {
-                                    showTechnicalDetails.toggle()
+
+                        DisclosureGroup("Advanced Details", isExpanded: $showTechnicalDetails) {
+                            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 6) {
+                                GridRow {
+                                    Text("Exact Size")
+                                        .foregroundStyle(.secondary)
+                                    Text("\(item.compressedSize.formatted()) bytes")
+                                        .monospacedDigit()
                                 }
-                            } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: showTechnicalDetails ? "chevron.down" : "chevron.right")
-                                        .font(.caption2.weight(.semibold))
-                                        .frame(width: 10, alignment: .center)
-                                    Text("Advanced Details")
-                                        .font(.subheadline)
-                                    Spacer()
+                                GridRow {
+                                    Text("Object ID")
+                                        .foregroundStyle(.secondary)
+                                    Text(String(format: "0x%08X", item.handle))
+                                        .monospaced()
                                 }
-                                .foregroundStyle(.secondary)
-                                .contentShape(Rectangle())
+                                GridRow {
+                                    Text("Parent ID")
+                                        .foregroundStyle(.secondary)
+                                    Text(String(format: "0x%08X", item.parentHandle))
+                                        .monospaced()
+                                }
+                                GridRow {
+                                    Text("Storage ID")
+                                        .foregroundStyle(.secondary)
+                                    Text(String(format: "0x%08X", item.storageID))
+                                        .monospaced()
+                                }
+                                GridRow {
+                                    Text("Format")
+                                        .foregroundStyle(.secondary)
+                                    Text(String(format: "0x%04X", item.formatCode))
+                                        .monospaced()
+                                }
                             }
-                            .buttonStyle(.plain)
-                            
-                            if showTechnicalDetails {
-                                Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 8) {
-                                    GridRow {
-                                        Text("Exact Size")
-                                            .foregroundStyle(.secondary)
-                                        Text("\(item.compressedSize.formatted()) bytes")
-                                            .monospacedDigit()
-                                    }
-                                    GridRow {
-                                        Text("Object ID")
-                                            .foregroundStyle(.secondary)
-                                        Text(String(format: "0x%08X", item.handle))
-                                            .monospaced()
-                                    }
-                                    GridRow {
-                                        Text("Parent ID")
-                                            .foregroundStyle(.secondary)
-                                        Text(String(format: "0x%08X", item.parentHandle))
-                                            .monospaced()
-                                    }
-                                    GridRow {
-                                        Text("Storage ID")
-                                            .foregroundStyle(.secondary)
-                                        Text(String(format: "0x%08X", item.storageID))
-                                            .monospaced()
-                                    }
-                                    GridRow {
-                                        Text("Format")
-                                            .foregroundStyle(.secondary)
-                                        Text(String(format: "0x%04X", item.formatCode))
-                                            .monospaced()
-                                    }
-                                }
-                                .font(.caption)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            }
+                            .font(.caption)
+                            .textSelection(.enabled)
+                            .padding(.top, 6)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                     }
                     .padding(16)
                 }
@@ -908,13 +1025,13 @@ private struct InspectorPane: View {
 private struct DisconnectedPlaceholderView: View {
     var viewModel: MTPViewModel
     @State private var showHelpSteps = false
-    
+
     var body: some View {
         VStack(spacing: 16) {
             Image(systemName: "gamecontroller")
                 .font(.system(size: 44, weight: .light))
                 .foregroundStyle(.secondary)
-            
+
             VStack(spacing: 6) {
                 Text("Connect Nintendo Switch")
                     .font(.title2.weight(.semibold))
@@ -924,7 +1041,7 @@ private struct DisconnectedPlaceholderView: View {
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 380)
             }
-            
+
             Button {
                 Task { await viewModel.connectToDevice() }
             } label: {
@@ -934,7 +1051,7 @@ private struct DisconnectedPlaceholderView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
             .disabled(viewModel.isConnecting)
-            
+
             VStack(spacing: 10) {
                 Button {
                     withAnimation(.easeInOut(duration: 0.15)) {
@@ -952,20 +1069,20 @@ private struct DisconnectedPlaceholderView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                
+
                 if showHelpSteps {
-                    VStack(alignment: .center, spacing: 8) {
-                        HStack(alignment: .center, spacing: 6) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(alignment: .center, spacing: 8) {
                             Image(systemName: "gearshape")
                                 .frame(width: 16, alignment: .center)
                             Text("1. Open **System Settings** on your Switch")
                         }
-                        HStack(alignment: .center, spacing: 6) {
+                        HStack(alignment: .center, spacing: 8) {
                             Image(systemName: "photo.on.rectangle")
                                 .frame(width: 16, alignment: .center)
                             Text("2. Select **Data Management → Manage Screenshots and Videos**")
                         }
-                        HStack(alignment: .center, spacing: 6) {
+                        HStack(alignment: .center, spacing: 8) {
                             Image(systemName: "cable.connector")
                                 .frame(width: 16, alignment: .center)
                             Text("3. Choose **Copy to a Computer via USB Connection**")
@@ -973,7 +1090,8 @@ private struct DisconnectedPlaceholderView: View {
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
+                    .padding(12)
+                    .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
             }
         }
@@ -983,8 +1101,8 @@ private struct DisconnectedPlaceholderView: View {
 }
 
 private struct BottomStatusBar: View {
-    var viewModel: MTPViewModel
-    
+    @Bindable var viewModel: MTPViewModel
+
     var body: some View {
         HStack(spacing: 10) {
             if let transfer = viewModel.transferStatus {
@@ -1000,12 +1118,43 @@ private struct BottomStatusBar: View {
                     .font(.caption)
                 Text(banner)
                     .font(.caption)
+                    .lineLimit(1)
+            } else {
+                Text(statusSummaryText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
+
             Spacer()
+
+            if viewModel.viewMode == .grid {
+                HStack(spacing: 6) {
+                    Image(systemName: "photo")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    Slider(value: $viewModel.gridZoom, in: 130...250)
+                        .controlSize(.mini)
+                        .frame(width: 84)
+                        .help("Adjust thumbnail size")
+                    Image(systemName: "photo")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 6)
+        .frame(height: 28)
         .background(.bar)
+    }
+
+    private var statusSummaryText: String {
+        let count = viewModel.filteredAndSortedItems.count
+        let selCount = viewModel.selectedItemIDs.count
+        if selCount > 0 {
+            return "\(selCount) of \(count) selected"
+        }
+        return "\(count) item\(count == 1 ? "" : "s")"
     }
 }
 
@@ -1015,16 +1164,42 @@ private struct MediaLightboxSheet: View {
     @Bindable var viewModel: MTPViewModel
     let item: MTPObjectItem
     @Environment(\.dismiss) private var dismiss
-    
+
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text(item.folderName.isEmpty ? item.filename : item.folderName)
-                    .font(.headline)
-                    .lineLimit(1)
-                
+            HStack(spacing: 10) {
+                HStack(spacing: 4) {
+                    Button {
+                        viewModel.navigatePreview(offset: -1, from: item)
+                    } label: {
+                        Image(systemName: "chevron.left")
+                    }
+                    .disabled(!viewModel.canNavigatePreview(offset: -1, from: item))
+                    .help("Previous Item")
+
+                    Button {
+                        viewModel.navigatePreview(offset: 1, from: item)
+                    } label: {
+                        Image(systemName: "chevron.right")
+                    }
+                    .disabled(!viewModel.canNavigatePreview(offset: 1, from: item))
+                    .help("Next Item")
+                }
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(item.folderName.isEmpty ? item.filename : item.folderName)
+                        .font(.headline)
+                        .lineLimit(1)
+                    if !item.formattedDate.isEmpty {
+                        Text(item.formattedDate)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+
                 Spacer()
-                
+
                 if item.isImage {
                     Button {
                         viewModel.copyImageToClipboard(item)
@@ -1032,14 +1207,14 @@ private struct MediaLightboxSheet: View {
                         Label("Copy", systemImage: "doc.on.doc")
                     }
                 }
-                
+
                 Button {
                     viewModel.quickSaveToDownloads([item])
                 } label: {
                     Label("Save", systemImage: "arrow.down.circle.fill")
                 }
                 .buttonStyle(.borderedProminent)
-                
+
                 Button {
                     dismiss()
                 } label: {
@@ -1053,9 +1228,9 @@ private struct MediaLightboxSheet: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .background(.bar)
-            
+
             Divider()
-            
+
             Color.black
                 .aspectRatio(16.0 / 9.0, contentMode: .fit)
                 .overlay {
@@ -1099,7 +1274,7 @@ private struct MediaLightboxSheet: View {
 
 struct MacVideoPlayerView: NSViewRepresentable {
     let player: AVPlayer
-    
+
     func makeNSView(context: Context) -> AVPlayerView {
         let view = AVPlayerView()
         view.controlsStyle = .inline
@@ -1107,19 +1282,23 @@ struct MacVideoPlayerView: NSViewRepresentable {
         view.player = player
         return view
     }
-    
+
     func updateNSView(_ nsView: AVPlayerView, context: Context) {
         if nsView.player !== player {
             nsView.player = player
         }
     }
-    
+
     static func dismantleNSView(_ nsView: AVPlayerView, coordinator: ()) {
         nsView.player?.pause()
         nsView.player = nil
     }
 }
 
-#Preview {
+#Preview("Default") {
     ContentView()
+}
+
+#Preview("Inspector Open (Min Width)") {
+    ContentView(initialInspectorOpen: true)
 }

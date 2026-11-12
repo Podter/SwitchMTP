@@ -26,13 +26,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = false
 
+        guard ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] != "1" else {
+            return
+        }
+
         if let bundleID = Bundle.main.bundleIdentifier {
             let currentPID = ProcessInfo.processInfo.processIdentifier
             let otherInstances = NSRunningApplication
                 .runningApplications(withBundleIdentifier: bundleID)
                 .filter { $0.processIdentifier != currentPID }
 
-            if let existing = otherInstances.first {
+            for instance in otherInstances where instance.activationPolicy != .regular {
+                instance.forceTerminate()
+            }
+
+            if let existing = otherInstances.first(where: { $0.activationPolicy == .regular && !$0.isTerminated }) {
                 existing.activate()
                 NSApp.terminate(nil)
                 return
@@ -68,6 +76,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func configureWindowsAndMenus() {
         for window in NSApp.windows {
             window.tabbingMode = .disallowed
+            if window.identifier?.rawValue == "main" || window.contentMinSize.width < 860 {
+                window.contentMinSize = NSSize(width: 860, height: 540)
+            }
         }
         if let mainMenu = NSApp.mainMenu {
             removeTabMenuItems(in: mainMenu)
@@ -92,12 +103,13 @@ struct SwitchMTPApp: App {
     var body: some Scene {
         Window("SwitchMTP", id: "main") {
             ContentView()
-                .frame(minWidth: 860, minHeight: 540)
         }
         .defaultSize(width: 1120, height: 740)
         .windowToolbarStyle(.unified)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            SidebarCommands()
+            InspectorCommands()
         }
     }
 }

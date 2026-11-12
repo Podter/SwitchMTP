@@ -153,22 +153,66 @@ nonisolated struct MTPObjectItem: Identifiable, Sendable, Equatable, Hashable {
     let modificationDateString: String
     let captureDate: Date?
     let modificationDate: Date?
+    let displayDate: Date?
+    let formattedDate: String
+    let isFolder: Bool
+    let isImage: Bool
+    let isVideo: Bool
+    private let preformattedFileBytes: String
     var folderName: String = ""
     var childCount: Int? = nil
     
+    init(
+        handle: UInt32,
+        storageID: UInt32,
+        parentHandle: UInt32,
+        formatCode: UInt16,
+        compressedSize: UInt64,
+        thumbFormat: UInt16,
+        thumbCompressedSize: UInt32,
+        thumbWidth: UInt32,
+        thumbHeight: UInt32,
+        imageWidth: UInt32,
+        imageHeight: UInt32,
+        filename: String,
+        captureDateString: String,
+        modificationDateString: String,
+        captureDate: Date?,
+        modificationDate: Date?,
+        folderName: String = "",
+        childCount: Int? = nil
+    ) {
+        self.handle = handle
+        self.storageID = storageID
+        self.parentHandle = parentHandle
+        self.formatCode = formatCode
+        self.compressedSize = compressedSize
+        self.thumbFormat = thumbFormat
+        self.thumbCompressedSize = thumbCompressedSize
+        self.thumbWidth = thumbWidth
+        self.thumbHeight = thumbHeight
+        self.imageWidth = imageWidth
+        self.imageHeight = imageHeight
+        self.filename = filename
+        self.captureDateString = captureDateString
+        self.modificationDateString = modificationDateString
+        self.captureDate = captureDate
+        self.modificationDate = modificationDate
+        self.folderName = folderName
+        self.childCount = childCount
+        
+        let folder = MTPObjectFormat.isFolder(formatCode)
+        self.isFolder = folder
+        self.isImage = !folder && MTPObjectFormat.isImage(formatCode, filename: filename)
+        self.isVideo = !folder && MTPObjectFormat.isVideo(formatCode, filename: filename)
+        
+        let resolvedDate = captureDate ?? modificationDate ?? MTPDateParser.parseFromFilename(filename)
+        self.displayDate = resolvedDate
+        self.formattedDate = resolvedDate.map { MTPDateParser.formatDisplay($0) } ?? ""
+        self.preformattedFileBytes = folder ? "" : ByteCountFormatter.string(fromByteCount: Int64(compressedSize), countStyle: .file)
+    }
+    
     var id: UInt32 { handle }
-    
-    var isFolder: Bool {
-        MTPObjectFormat.isFolder(formatCode)
-    }
-    
-    var isImage: Bool {
-        !isFolder && MTPObjectFormat.isImage(formatCode, filename: filename)
-    }
-    
-    var isVideo: Bool {
-        !isFolder && MTPObjectFormat.isVideo(formatCode, filename: filename)
-    }
     
     var hasThumbnail: Bool {
         thumbCompressedSize > 0
@@ -194,11 +238,7 @@ nonisolated struct MTPObjectItem: Identifiable, Sendable, Equatable, Hashable {
             }
             return "—"
         }
-        return ByteCountFormatter.string(fromByteCount: Int64(compressedSize), countStyle: .file)
-    }
-    
-    var displayDate: Date? {
-        captureDate ?? modificationDate ?? MTPDateParser.parseFromFilename(filename)
+        return preformattedFileBytes
     }
 }
 
@@ -252,6 +292,17 @@ nonisolated enum MTPDateParser {
         df.dateFormat = "yyyyMMddHHmmss"
         return df
     }()
+    
+    private static let displayFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateStyle = .medium
+        df.timeStyle = .short
+        return df
+    }()
+    
+    static func formatDisplay(_ date: Date) -> String {
+        displayFormatter.string(from: date)
+    }
     
     static func parse(_ raw: String) -> Date? {
         guard !raw.isEmpty else { return nil }

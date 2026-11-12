@@ -102,8 +102,20 @@ final class MTPViewModel {
     }
     
     var breadcrumbs: [BreadcrumbStep] = []
-    var currentItems: [MTPObjectItem] = []
-    var allMediaItems: [MTPObjectItem] = []
+    var currentItems: [MTPObjectItem] = [] {
+        didSet {
+            rebuildFilteredItems()
+        }
+    }
+    var allMediaItems: [MTPObjectItem] = [] {
+        didSet {
+            allScreenshotsCount = allMediaItems.reduce(0) { $0 + ($1.isImage ? 1 : 0) }
+            allVideosCount = allMediaItems.reduce(0) { $0 + ($1.isVideo ? 1 : 0) }
+        }
+    }
+    private(set) var allScreenshotsCount: Int = 0
+    private(set) var allVideosCount: Int = 0
+    private(set) var filteredAndSortedItems: [MTPObjectItem] = []
     var hasLoadedAllMedia: Bool = false
     
     var selectedItemIDs: Set<UInt32> = [] {
@@ -112,16 +124,35 @@ final class MTPViewModel {
         }
     }
     
-    var searchText: String = ""
-    var mediaFilter: MediaTypeFilter = .all
-    var sortOrder: MediaSortOrder = .dateNewest
+    var searchText: String = "" {
+        didSet {
+            if oldValue != searchText {
+                rebuildFilteredItems()
+            }
+        }
+    }
+    var mediaFilter: MediaTypeFilter = .all {
+        didSet {
+            if oldValue != mediaFilter {
+                rebuildFilteredItems()
+            }
+        }
+    }
+    var sortOrder: MediaSortOrder = .dateNewest {
+        didSet {
+            if oldValue != sortOrder {
+                rebuildFilteredItems()
+            }
+        }
+    }
     var viewMode: BrowserViewMode = .grid
     var gridZoom: Double = 175
     var showInspector: Bool = false
     
     var thumbnails: [UInt32: NSImage] = [:]
-    private var loadingThumbnails: Set<UInt32> = []
-    private var folderItemsCache: [UInt32: [MTPObjectItem]] = [:]
+    private(set) var isLoadingThumbnails: Bool = false
+    @ObservationIgnored private var loadingThumbnails: Set<UInt32> = []
+    @ObservationIgnored private var folderItemsCache: [UInt32: [MTPObjectItem]] = [:]
     
     // Preview state
     var inspectedItem: MTPObjectItem? = nil
@@ -142,14 +173,40 @@ final class MTPViewModel {
     
     // Transfer state
     var transferStatus: TransferStatus? = nil
+    private(set) var isTransferring: Bool = false
     
     var isWorking: Bool {
-        isConnecting || isLoadingDirectory || isScanningAllMedia || !loadingThumbnails.isEmpty || transferStatus != nil
+        isConnecting || isLoadingDirectory || isScanningAllMedia || isLoadingThumbnails || isTransferring
+    }
+    
+    var canGoBack: Bool {
+        breadcrumbs.count > 1
+    }
+    
+    func navigateBack() {
+        guard breadcrumbs.count > 1 else { return }
+        let parentStep = breadcrumbs[breadcrumbs.count - 2]
+        if parentStep.id == 0xFFFFFFFF {
+            selectedSidebar = .storageRoot(parentStep.storageID)
+        } else {
+            Task {
+                await navigateToDirectory(
+                    storageID: parentStep.storageID,
+                    parentHandle: parentStep.id,
+                    title: parentStep.title
+                )
+            }
+        }
     }
     
     private var usbMonitorTask: Task<Void, Never>? = nil
     
+    static var isRunningInPreview: Bool {
+        ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
+    }
+    
     init() {
+        guard !Self.isRunningInPreview else { return }
         startUSBMonitoring()
     }
     
@@ -223,6 +280,7 @@ final class MTPViewModel {
     func refresh() async {
         folderItemsCache.removeAll()
         loadingThumbnails.removeAll()
+        isLoadingThumbnails = false
         hasLoadedAllMedia = false
         allMediaItems.removeAll()
         await connectToDevice()
@@ -237,6 +295,7 @@ final class MTPViewModel {
         currentItems = []
         allMediaItems = []
         loadingThumbnails.removeAll()
+        isLoadingThumbnails = false
         hasLoadedAllMedia = false
         selectedItemIDs.removeAll()
         inspectedItem = nil
@@ -423,9 +482,30 @@ final class MTPViewModel {
         }
     }
     
+    func canNavigatePreview(offset: Int, from item: MTPObjectItem) -> Bool {
+        let mediaItems = filteredAndSortedItems.filter { !$0.isFolder }
+        guard let currentIndex = mediaItems.firstIndex(where: { $0.handle == item.handle }) else {
+            return false
+        }
+        let targetIndex = currentIndex + offset
+        return mediaItems.indices.contains(targetIndex)
+    }
+    
+    func navigatePreview(offset: Int, from item: MTPObjectItem) {
+        let mediaItems = filteredAndSortedItems.filter { !$0.isFolder }
+        guard let currentIndex = mediaItems.firstIndex(where: { $0.handle == item.handle }) else {
+            return
+        }
+        let targetIndex = currentIndex + offset
+        guard mediaItems.indices.contains(targetIndex) else { return }
+        let nextItem = mediaItems[targetIndex]
+        selectedItemIDs = [nextItem.handle]
+        fullScreenPreviewItem = nextItem
+    }
+    
     // MARK: - Filtering & Sorting
     
-    var filteredAndSortedItems: [MTPObjectItem] {
+    private func rebuildFilteredItems() {
         var list = currentItems
         
         // Apply media filter
@@ -476,11 +556,12 @@ final class MTPViewModel {
                 return a.filename > b.filename
             }
         }
-        return list
+        filteredAndSortedItems = list
     }
     
     var selectedItems: [MTPObjectItem] {
-        filteredAndSortedItems.filter { selectedItemIDs.contains($0.handle) }
+        guard !selectedItemIDs.isEmpty else { return [] }
+        return filteredAndSortedItems.filter { selectedItemIDs.contains($0.handle) }
     }
     
     var totalMediaCountSummary: String {
@@ -505,6 +586,9 @@ final class MTPViewModel {
             return
         }
         loadingThumbnails.insert(item.handle)
+        if !isLoadingThumbnails {
+            isLoadingThumbnails = true
+        }
         let handle = item.handle
         Task {
             do {
@@ -516,6 +600,9 @@ final class MTPViewModel {
                 // Ignore individual thumbnail failures
             }
             self.loadingThumbnails.remove(handle)
+            if self.loadingThumbnails.isEmpty && self.isLoadingThumbnails {
+                self.isLoadingThumbnails = false
+            }
         }
     }
     
@@ -721,15 +808,22 @@ final class MTPViewModel {
         
         guard !flatFiles.isEmpty else { return }
         
+        isTransferring = true
+        defer {
+            isTransferring = false
+            transferStatus = nil
+        }
+        
         var lastExportedURL: URL? = nil
         let startTime = CFAbsoluteTimeGetCurrent()
         var cumulativeBytes: Int64 = 0
         
         for (index, fileItem) in flatFiles.enumerated() {
             let fileURL = baseDirectory.appendingPathComponent(Self.sanitizeFilename(fileItem.filename))
+            let statusTitle = flatFiles.count == 1 ? "Exporting File…" : "Exporting \(index + 1) of \(flatFiles.count)…"
             
             self.transferStatus = TransferStatus(
-                title: flatFiles.count == 1 ? "Exporting File…" : "Exporting \(index + 1) of \(flatFiles.count)…",
+                title: statusTitle,
                 currentFile: fileItem.filename,
                 completedFiles: index,
                 totalFiles: flatFiles.count,
@@ -745,7 +839,7 @@ final class MTPViewModel {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.transferStatus = TransferStatus(
-                        title: flatFiles.count == 1 ? "Exporting File…" : "Exporting \(index + 1) of \(flatFiles.count)…",
+                        title: statusTitle,
                         currentFile: fileItem.filename,
                         completedFiles: index,
                         totalFiles: flatFiles.count,
@@ -759,7 +853,6 @@ final class MTPViewModel {
             lastExportedURL = fileURL
         }
         
-        self.transferStatus = nil
         showTemporaryBanner("Exported \(flatFiles.count) file\(flatFiles.count == 1 ? "" : "s") to \"\(baseDirectory.lastPathComponent)\"")
         
         if revealWhenDone, let lastExportedURL {

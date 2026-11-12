@@ -19,6 +19,7 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
     private var pipeInterrupt: IOUSBHostPipe?
     private var maxPacketSizeIn: Int = 512
     private var transactionID: UInt32 = 1
+    private var lastDrainedTransactionID: UInt32 = 0
     private var isSessionOpen: Bool = false
     
     init() {}
@@ -67,123 +68,279 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
         }
     }
     
+    private static func findSwitchInterfaceService() -> (service: io_service_t, properties: [String: Any])? {
+        guard let matching = IOServiceMatching("IOUSBHostInterface") else {
+            return nil
+        }
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
+            return nil
+        }
+        defer { IOObjectRelease(iterator) }
+        
+        var matchedService: io_service_t = 0
+        var matchedDict: [String: Any] = [:]
+        
+        var service = IOIteratorNext(iterator)
+        while service != 0 {
+            var props: Unmanaged<CFMutableDictionary>?
+            if IORegistryEntryCreateCFProperties(service, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+               let dict = props?.takeRetainedValue() as? [String: Any] {
+                let vid = dict["idVendor"] as? Int ?? -1
+                let pid = dict["idProduct"] as? Int ?? -1
+                let ifClass = dict["bInterfaceClass"] as? Int ?? -1
+                let ifSubClass = dict["bInterfaceSubClass"] as? Int ?? -1
+                let usbString = dict["kUSBString"] as? String ?? ""
+                
+                let isSwitch = (vid == Self.nintendoVendorID && (pid == Self.switchMTPProductID || ifClass == 6))
+                let isMTP = (ifClass == 6 && ifSubClass == 1) || usbString == "MTP"
+                
+                if isSwitch || isMTP {
+                    if matchedService != 0 {
+                        IOObjectRelease(matchedService)
+                    }
+                    matchedService = service
+                    matchedDict = dict
+                    if isSwitch {
+                        service = IOIteratorNext(iterator)
+                        while service != 0 {
+                            IOObjectRelease(service)
+                            service = IOIteratorNext(iterator)
+                        }
+                        break
+                    }
+                    service = IOIteratorNext(iterator)
+                    continue
+                }
+            }
+            IOObjectRelease(service)
+            service = IOIteratorNext(iterator)
+        }
+        
+        guard matchedService != 0 else {
+            return nil
+        }
+        return (matchedService, matchedDict)
+    }
+    
+    private static func competingHolderPIDs(for interfaceService: io_service_t) -> [(pid: pid_t, creator: String)] {
+        let currentPID = getpid()
+        var results: [(pid: pid_t, creator: String)] = []
+        var seenPIDs: Set<pid_t> = []
+        
+        func inspectChildren(of entry: io_registry_entry_t, includeAllUserClients: Bool) {
+            var childIterator: io_iterator_t = 0
+            guard IORegistryEntryGetChildIterator(entry, kIOServicePlane, &childIterator) == KERN_SUCCESS else {
+                return
+            }
+            defer { IOObjectRelease(childIterator) }
+            
+            var child = IOIteratorNext(childIterator)
+            while child != 0 {
+                defer {
+                    IOObjectRelease(child)
+                    child = IOIteratorNext(childIterator)
+                }
+                var props: Unmanaged<CFMutableDictionary>?
+                guard IORegistryEntryCreateCFProperties(child, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+                      let dict = props?.takeRetainedValue() as? [String: Any],
+                      let creator = dict["IOUserClientCreator"] as? String,
+                      creator.hasPrefix("pid ") else {
+                    continue
+                }
+                
+                let afterPrefix = creator.dropFirst(4)
+                let pidDigits = afterPrefix.prefix(while: { $0.isNumber })
+                guard let holderPID = pid_t(pidDigits), holderPID > 0, holderPID != currentPID else {
+                    continue
+                }
+                
+                let lowerCreator = creator.lowercased()
+                let isKnownCompetingClient =
+                    lowerCreator.contains("ptpcamera") ||
+                    lowerCreator.contains("switchmtp") ||
+                    lowerCreator.contains("preview")
+                
+                if (includeAllUserClients || isKnownCompetingClient) && !seenPIDs.contains(holderPID) {
+                    seenPIDs.insert(holderPID)
+                    results.append((holderPID, creator))
+                }
+            }
+        }
+        
+        inspectChildren(of: interfaceService, includeAllUserClients: true)
+        
+        var parentDevice: io_registry_entry_t = 0
+        if IORegistryEntryGetParentEntry(interfaceService, kIOServicePlane, &parentDevice) == KERN_SUCCESS,
+           parentDevice != 0 {
+            defer { IOObjectRelease(parentDevice) }
+            inspectChildren(of: parentDevice, includeAllUserClients: false)
+        }
+        
+        return results
+    }
+    
+    @discardableResult
+    private static func releaseCompetingUSBHoldersIfNeeded() -> Bool {
+        guard let found = findSwitchInterfaceService() else {
+            return false
+        }
+        let holders = competingHolderPIDs(for: found.service)
+        IOObjectRelease(found.service)
+        
+        guard !holders.isEmpty else {
+            return false
+        }
+        
+        for holder in holders {
+            print("[SwitchMTP] Releasing competing USB interface holder: \(holder.creator)")
+            _ = Darwin.kill(holder.pid, SIGTERM)
+        }
+        
+        let termDeadline = Date().addingTimeInterval(0.15)
+        while Date() < termDeadline {
+            let anyAlive = holders.contains { Darwin.kill($0.pid, 0) == 0 }
+            if !anyAlive { break }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        
+        for holder in holders where Darwin.kill(holder.pid, 0) == 0 {
+            _ = Darwin.kill(holder.pid, SIGKILL)
+        }
+        
+        let killDeadline = Date().addingTimeInterval(0.4)
+        while Date() < killDeadline {
+            let anyAlive = holders.contains { Darwin.kill($0.pid, 0) == 0 }
+            if !anyAlive { break }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        
+        // Allow kernel IOUSBHostDevice teardown / IOUSBHostInterface re-enumeration to settle
+        Thread.sleep(forTimeInterval: 0.35)
+        return true
+    }
+    
+    private static func waitForSwitchInterfaceService(timeout: TimeInterval) -> (service: io_service_t, properties: [String: Any])? {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            if let found = findSwitchInterfaceService() {
+                return found
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        } while Date() < deadline
+        return nil
+    }
+    
     func connect() async throws -> MTPDeviceDetails {
         try await runOnUSBQueue {
             self.disconnectSync()
             
-            guard let matching = IOServiceMatching("IOUSBHostInterface") else {
-                throw MTPError.deviceNotFound
-            }
-            var iterator: io_iterator_t = 0
-            let kr = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator)
-            guard kr == KERN_SUCCESS else {
-                throw MTPError.deviceNotFound
-            }
-            defer { IOObjectRelease(iterator) }
+            var lastError: Error?
+            let maxAttempts = 5
             
-            var matchedService: io_service_t = 0
-            var matchedDict: [String: Any] = [:]
-            
-            var service = IOIteratorNext(iterator)
-            while service != 0 {
-                var props: Unmanaged<CFMutableDictionary>?
-                if IORegistryEntryCreateCFProperties(service, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS,
-                   let dict = props?.takeRetainedValue() as? [String: Any] {
-                    let vid = dict["idVendor"] as? Int ?? -1
-                    let pid = dict["idProduct"] as? Int ?? -1
-                    let ifClass = dict["bInterfaceClass"] as? Int ?? -1
-                    let ifSubClass = dict["bInterfaceSubClass"] as? Int ?? -1
-                    let usbString = dict["kUSBString"] as? String ?? ""
-                    
-                    let isSwitch = (vid == Self.nintendoVendorID && (pid == Self.switchMTPProductID || ifClass == 6))
-                    let isMTP = (ifClass == 6 && ifSubClass == 1) || usbString == "MTP"
-                    
-                    if isSwitch || isMTP {
-                        if matchedService != 0 {
-                            IOObjectRelease(matchedService)
-                        }
-                        matchedService = service
-                        matchedDict = dict
-                        if isSwitch {
-                            service = IOIteratorNext(iterator)
-                            while service != 0 {
-                                IOObjectRelease(service)
-                                service = IOIteratorNext(iterator)
-                            }
-                            break
-                        }
-                        service = IOIteratorNext(iterator)
-                        continue
+            for attempt in 1...maxAttempts {
+                if !Self.isSwitchPresentInRegistry() && attempt == 1 {
+                    throw MTPError.deviceNotFound
+                }
+                
+                let releasedHolder = Self.releaseCompetingUSBHoldersIfNeeded()
+                
+                guard let found = Self.waitForSwitchInterfaceService(timeout: 1.5) else {
+                    throw MTPError.deviceNotFound
+                }
+                let matchedService = found.service
+                let matchedDict = found.properties
+                
+                var claimedInterface: IOUSBHostInterface?
+                do {
+                    claimedInterface = try IOUSBHostInterface(
+                        __ioService: matchedService,
+                        options: [.deviceSeize],
+                        queue: nil,
+                        interestHandler: nil
+                    )
+                } catch {
+                    do {
+                        claimedInterface = try IOUSBHostInterface(
+                            __ioService: matchedService,
+                            options: [],
+                            queue: nil,
+                            interestHandler: nil
+                        )
+                    } catch let fallbackError {
+                        lastError = MTPError.interfaceOpenFailed(fallbackError.localizedDescription)
                     }
                 }
-                IOObjectRelease(service)
-                service = IOIteratorNext(iterator)
-            }
-            
-            guard matchedService != 0 else {
-                throw MTPError.deviceNotFound
-            }
-            
-            let interface: IOUSBHostInterface
-            do {
-                interface = try IOUSBHostInterface(
-                    __ioService: matchedService,
-                    options: [.deviceSeize],
-                    queue: nil,
-                    interestHandler: nil
-                )
-            } catch {
-                throw MTPError.interfaceOpenFailed(error.localizedDescription)
-            }
-            
-            let ifDesc = interface.interfaceDescriptor
-            let cfgDesc = interface.configurationDescriptor
-            
-            var currentHeader: UnsafePointer<IOUSBDescriptorHeader>? = nil
-            var bulkInAddr: UInt8 = 0
-            var bulkOutAddr: UInt8 = 0
-            var intrInAddr: UInt8 = 0
-            var inMaxPacket: Int = 512
-            
-            while let nextEp = IOUSBGetNextEndpointDescriptor(cfgDesc, ifDesc, currentHeader) {
-                currentHeader = UnsafeRawPointer(nextEp).assumingMemoryBound(to: IOUSBDescriptorHeader.self)
-                let addr = nextEp.pointee.bEndpointAddress
-                let type = IOUSBGetEndpointType(nextEp)
-                let maxPkt = Int(nextEp.pointee.wMaxPacketSize & 0x07FF)
-                if type == 2 && (addr & 0x80) != 0 {
-                    bulkInAddr = addr
-                    if maxPkt > 0 { inMaxPacket = maxPkt }
-                } else if type == 2 && (addr & 0x80) == 0 {
-                    bulkOutAddr = addr
-                } else if type == 3 && (addr & 0x80) != 0 {
-                    intrInAddr = addr
+                IOObjectRelease(matchedService)
+                
+                guard let interface = claimedInterface else {
+                    if attempt < maxAttempts {
+                        Thread.sleep(forTimeInterval: 0.25 * Double(attempt))
+                        continue
+                    }
+                    throw lastError ?? MTPError.interfaceOpenFailed("Exclusive open of USB interface failed.")
+                }
+                
+                let ifDesc = interface.interfaceDescriptor
+                let cfgDesc = interface.configurationDescriptor
+                
+                var currentHeader: UnsafePointer<IOUSBDescriptorHeader>? = nil
+                var bulkInAddr: UInt8 = 0
+                var bulkOutAddr: UInt8 = 0
+                var intrInAddr: UInt8 = 0
+                var inMaxPacket: Int = 512
+                
+                while let nextEp = IOUSBGetNextEndpointDescriptor(cfgDesc, ifDesc, currentHeader) {
+                    currentHeader = UnsafeRawPointer(nextEp).assumingMemoryBound(to: IOUSBDescriptorHeader.self)
+                    let addr = nextEp.pointee.bEndpointAddress
+                    let type = IOUSBGetEndpointType(nextEp)
+                    let maxPkt = Int(nextEp.pointee.wMaxPacketSize & 0x07FF)
+                    if type == 2 && (addr & 0x80) != 0 {
+                        bulkInAddr = addr
+                        if maxPkt > 0 { inMaxPacket = maxPkt }
+                    } else if type == 2 && (addr & 0x80) == 0 {
+                        bulkOutAddr = addr
+                    } else if type == 3 && (addr & 0x80) != 0 {
+                        intrInAddr = addr
+                    }
+                }
+                
+                guard bulkInAddr != 0 && bulkOutAddr != 0 else {
+                    interface.destroy()
+                    throw MTPError.pipeNotFound
+                }
+                
+                do {
+                    let inPipe = try interface.copyPipe(withAddress: Int(bulkInAddr))
+                    let outPipe = try interface.copyPipe(withAddress: Int(bulkOutAddr))
+                    let intrPipe = intrInAddr != 0 ? (try? interface.copyPipe(withAddress: Int(intrInAddr))) : nil
+                    
+                    self.hostInterface = interface
+                    self.pipeIn = inPipe
+                    self.pipeOut = outPipe
+                    self.pipeInterrupt = intrPipe
+                    self.maxPacketSizeIn = inMaxPacket
+                    
+                    if releasedHolder {
+                        self.drainPendingBulkInSync()
+                    }
+                    
+                    try self.openSessionSync()
+                    
+                    let devInfoPayload = try self.executeCommandSync(.getDeviceInfo, timeout: 4.0).data
+                    return self.parseDeviceInfo(devInfoPayload, usbProperties: matchedDict)
+                } catch {
+                    self.disconnectSync()
+                    lastError = error
+                    if attempt < maxAttempts {
+                        Thread.sleep(forTimeInterval: 0.25 * Double(attempt))
+                        continue
+                    }
+                    throw error
                 }
             }
             
-            guard bulkInAddr != 0 && bulkOutAddr != 0 else {
-                interface.destroy()
-                throw MTPError.pipeNotFound
-            }
-            
-            do {
-                let inPipe = try interface.copyPipe(withAddress: Int(bulkInAddr))
-                let outPipe = try interface.copyPipe(withAddress: Int(bulkOutAddr))
-                let intrPipe = intrInAddr != 0 ? (try? interface.copyPipe(withAddress: Int(intrInAddr))) : nil
-                
-                self.hostInterface = interface
-                self.pipeIn = inPipe
-                self.pipeOut = outPipe
-                self.pipeInterrupt = intrPipe
-                self.maxPacketSizeIn = inMaxPacket
-                
-                try self.openSessionSync()
-                
-                let devInfoPayload = try self.executeCommandSync(.getDeviceInfo, timeout: 4.0).data
-                return self.parseDeviceInfo(devInfoPayload, usbProperties: matchedDict)
-            } catch {
-                self.disconnectSync()
-                throw error
-            }
+            throw lastError ?? MTPError.deviceNotFound
         }
     }
     
@@ -211,14 +368,72 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
         transactionID = 1
     }
     
+    private func drainPendingBulkInSync() {
+        guard let pipeIn else { return }
+        let bufLen = max(maxPacketSizeIn, 65536)
+        guard let buf = NSMutableData(length: bufLen) else { return }
+        
+        var expectingResponseAfterData = false
+        var remainingDataBytes = 0
+        
+        for _ in 0..<16 {
+            var transferred = 0
+            do {
+                try pipeIn.__sendIORequest(with: buf, bytesTransferred: &transferred, completionTimeout: 0.25)
+                guard transferred > 0 else { break }
+                
+                if remainingDataBytes > 0 {
+                    remainingDataBytes = max(0, remainingDataBytes - transferred)
+                    continue
+                }
+                
+                if transferred >= 12 {
+                    let data = Data(bytes: buf.bytes, count: transferred)
+                    let containerLen = Int(data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self) })
+                    let containerType = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt16.self) }
+                    let tx = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 8, as: UInt32.self) }
+                    if tx > 0 && tx < 100_000 {
+                        lastDrainedTransactionID = tx
+                    }
+                    print("[SwitchMTP] Drained \(transferred) pending bytes from Bulk IN (len=\(containerLen), type=\(containerType), tx=\(tx))")
+                    
+                    if containerType == MTPContainerType.data.rawValue && containerLen >= 12 {
+                        let payloadInFirstPacket = transferred - 12
+                        remainingDataBytes = max(0, (containerLen - 12) - payloadInFirstPacket)
+                        expectingResponseAfterData = true
+                    } else if containerType == MTPContainerType.response.rawValue {
+                        expectingResponseAfterData = false
+                        break
+                    }
+                } else if !expectingResponseAfterData {
+                    break
+                }
+            } catch {
+                break
+            }
+        }
+    }
+    
     private func openSessionSync() throws {
         transactionID = 0
-        let resp = try executeCommandSync(.openSession, parameters: [1], useExplicitTransactionID: 0, timeout: 3.0)
+        let resp: (data: Data, responseCode: UInt16, responseParams: [UInt32])
+        do {
+            resp = try executeCommandSync(.openSession, parameters: [1], useExplicitTransactionID: 0, timeout: 2.0)
+        } catch {
+            drainPendingBulkInSync()
+            try? pipeIn?.clearStall()
+            try? pipeOut?.clearStall()
+            resp = try executeCommandSync(.openSession, parameters: [1], useExplicitTransactionID: 0, timeout: 2.5)
+        }
         print(String(format: "[SwitchMTP] OpenSession initial response: 0x%04X", resp.responseCode))
         if resp.responseCode == MTPResponseCode.sessionAlreadyOpen.rawValue {
             // Probe for the active TransactionID to send CloseSession (try last known tx first, then scan)
             let savedTx = UInt32(UserDefaults.standard.integer(forKey: "SwitchMTP.lastTransactionID"))
             var candidates: [UInt32] = []
+            if lastDrainedTransactionID > 0 {
+                candidates.append(lastDrainedTransactionID &+ 1)
+                candidates.append(lastDrainedTransactionID)
+            }
             if savedTx > 0 {
                 candidates.append(savedTx)
                 candidates.append(savedTx &+ 1)
