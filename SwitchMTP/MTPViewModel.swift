@@ -7,6 +7,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import AVFoundation
+import UniformTypeIdentifiers
 
 enum SidebarDestination: Hashable, Identifiable {
     case allMedia
@@ -123,6 +124,8 @@ final class MTPViewModel {
             handlePrimarySelectionChange()
         }
     }
+    @ObservationIgnored var selectionAnchorHandle: UInt32? = nil
+    @ObservationIgnored lazy var dragCoordinator = MTPDragExportCoordinator(client: client, viewModel: self)
     
     var searchText: String = "" {
         didSet {
@@ -147,11 +150,20 @@ final class MTPViewModel {
     }
     var viewMode: BrowserViewMode = .grid
     var gridZoom: Double = 2
-    var showInspector: Bool = false
+    var showInspector: Bool = false {
+        didSet {
+            if showInspector, let item = inspectedItem {
+                schedulePreviewLoad(for: item)
+            }
+        }
+    }
     
     var thumbnails: [UInt32: NSImage] = [:]
     private(set) var isLoadingThumbnails: Bool = false
     @ObservationIgnored private var loadingThumbnails: Set<UInt32> = []
+    @ObservationIgnored private var pendingThumbnailQueue: [UInt32] = []
+    @ObservationIgnored private var thumbnailWorkerTask: Task<Void, Never>? = nil
+    @ObservationIgnored private var previewLoadTask: Task<Void, Never>? = nil
     @ObservationIgnored private var folderItemsCache: [UInt32: [MTPObjectItem]] = [:]
     
     // Preview state
@@ -372,6 +384,9 @@ final class MTPViewModel {
         
         var aggregated: [MTPObjectItem] = []
         for folder in rootFolders {
+            while isTransferring {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
             if let cached = folderItemsCache[folder.handle] {
                 aggregated.append(contentsOf: cached.filter { !$0.isFolder })
                 continue
@@ -575,6 +590,42 @@ final class MTPViewModel {
     
     func clearSelection() {
         selectedItemIDs.removeAll()
+        selectionAnchorHandle = nil
+    }
+    
+    func selectRange(to targetHandle: UInt32, additive: Bool = false) {
+        let items = filteredAndSortedItems
+        guard let targetIndex = items.firstIndex(where: { $0.handle == targetHandle }) else {
+            selectedItemIDs = [targetHandle]
+            selectionAnchorHandle = targetHandle
+            return
+        }
+        let anchorHandle = selectionAnchorHandle ?? selectedItemIDs.first ?? targetHandle
+        guard let anchorIndex = items.firstIndex(where: { $0.handle == anchorHandle }) else {
+            selectedItemIDs = [targetHandle]
+            selectionAnchorHandle = targetHandle
+            return
+        }
+        let lower = min(anchorIndex, targetIndex)
+        let upper = max(anchorIndex, targetIndex)
+        let rangeHandles = Set(items[lower...upper].map(\.handle))
+        if additive {
+            selectedItemIDs.formUnion(rangeHandles)
+        } else {
+            selectedItemIDs = rangeHandles
+        }
+    }
+    
+    func itemsForDrag(startingWith primaryItem: MTPObjectItem) -> [MTPObjectItem] {
+        if selectedItemIDs.contains(primaryItem.handle) {
+            let selected = selectedItems
+            if !selected.isEmpty {
+                return selected
+            }
+        }
+        selectedItemIDs = [primaryItem.handle]
+        selectionAnchorHandle = primaryItem.handle
+        return [primaryItem]
     }
     
     // MARK: - Thumbnails & Preview
@@ -586,35 +637,54 @@ final class MTPViewModel {
             return
         }
         loadingThumbnails.insert(item.handle)
+        pendingThumbnailQueue.append(item.handle)
+        startThumbnailWorkerIfNeeded()
+    }
+    
+    private func startThumbnailWorkerIfNeeded() {
+        guard thumbnailWorkerTask == nil else { return }
         if !isLoadingThumbnails {
             isLoadingThumbnails = true
         }
-        let handle = item.handle
-        Task {
-            do {
-                let data = try await client.fetchThumbnail(handle: handle)
-                if let image = NSImage(data: data) {
-                    self.thumbnails[handle] = image
+        thumbnailWorkerTask = Task { [weak self] in
+            guard let self else { return }
+            while !self.pendingThumbnailQueue.isEmpty {
+                while self.isTransferring {
+                    try? await Task.sleep(for: .milliseconds(80))
                 }
-            } catch {
-                // Ignore individual thumbnail failures
+                guard !self.pendingThumbnailQueue.isEmpty else { break }
+                let handle = self.pendingThumbnailQueue.removeFirst()
+                if self.thumbnails[handle] != nil {
+                    self.loadingThumbnails.remove(handle)
+                    continue
+                }
+                do {
+                    let data = try await self.client.fetchThumbnail(handle: handle)
+                    if let image = NSImage(data: data) {
+                        self.thumbnails[handle] = image
+                    }
+                } catch {
+                    // Ignore individual thumbnail failures
+                }
+                self.loadingThumbnails.remove(handle)
             }
-            self.loadingThumbnails.remove(handle)
-            if self.loadingThumbnails.isEmpty && self.isLoadingThumbnails {
+            self.thumbnailWorkerTask = nil
+            if self.isLoadingThumbnails {
                 self.isLoadingThumbnails = false
             }
         }
     }
     
     private func preloadVisibleThumbnails(for items: [MTPObjectItem]) {
-        for item in items.prefix(40) where item.hasThumbnail {
+        for item in items.prefix(24) where item.hasThumbnail {
             requestThumbnailIfNeeded(for: item)
         }
     }
     
     private func handlePrimarySelectionChange() {
-        guard let firstID = selectedItemIDs.first,
-              let item = currentItems.first(where: { $0.handle == firstID }) ?? allMediaItems.first(where: { $0.handle == firstID }) else {
+        guard !selectedItemIDs.isEmpty,
+              let item = selectedItems.first ?? currentItems.first(where: { selectedItemIDs.contains($0.handle) }) else {
+            previewLoadTask?.cancel()
             inspectedItem = nil
             previewImage = nil
             previewPlayer?.pause()
@@ -624,7 +694,19 @@ final class MTPViewModel {
         }
         guard inspectedItem?.handle != item.handle else { return }
         inspectedItem = item
-        loadPreview(for: item)
+        previewImage = thumbnails[item.handle]
+        if showInspector {
+            schedulePreviewLoad(for: item)
+        }
+    }
+    
+    private func schedulePreviewLoad(for item: MTPObjectItem) {
+        previewLoadTask?.cancel()
+        previewLoadTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(160))
+            guard !Task.isCancelled, let self, self.inspectedItem?.handle == item.handle else { return }
+            self.loadPreview(for: item)
+        }
     }
     
     func loadPreview(for item: MTPObjectItem, forLightbox: Bool = false) {
@@ -860,7 +942,7 @@ final class MTPViewModel {
         }
     }
     
-    private func showTemporaryBanner(_ text: String) {
+    func showTemporaryBanner(_ text: String) {
         statusBanner = text
         Task {
             try? await Task.sleep(for: .seconds(4))
@@ -870,8 +952,369 @@ final class MTPViewModel {
         }
     }
     
-    private static func sanitizeFilename(_ name: String) -> String {
+    nonisolated static func sanitizeFilename(_ name: String) -> String {
         let invalid = CharacterSet(charactersIn: "/:\\")
         return name.components(separatedBy: invalid).joined(separator: "-")
+    }
+    
+    func setTransferStateFromDrag(isTransferring: Bool, status: TransferStatus?) {
+        self.isTransferring = isTransferring
+        self.transferStatus = status
+    }
+}
+
+// MARK: - Native Finder & App Drag-and-Drop Support
+
+nonisolated final class MTPFilePromiseProvider: NSFilePromiseProvider, @unchecked Sendable {
+    let item: MTPObjectItem
+    weak var coordinator: MTPDragExportCoordinator?
+    var cachedImageFallback: NSImage?
+    private var extraPromisedTypes: [NSPasteboard.PasteboardType] = []
+    
+    init(item: MTPObjectItem, coordinator: MTPDragExportCoordinator, cachedImageFallback: NSImage? = nil) {
+        self.item = item
+        self.coordinator = coordinator
+        self.cachedImageFallback = cachedImageFallback
+        
+        let resolvedFileType = Self.resolveUTI(for: item)
+        var extras: [NSPasteboard.PasteboardType] = []
+        
+        // Only advertise a direct .fileURL if the file is already materialized on local disk.
+        // Otherwise, NSFilePromiseProvider's promised-file-url types handle Finder, Desktop,
+        // and external apps asynchronously on filePromiseQueue without blocking the main thread.
+        if coordinator.existingCachedFileURL(for: item) != nil {
+            extras.append(.fileURL)
+        }
+        if item.isImage {
+            extras.append(.tiff)
+        }
+        self.extraPromisedTypes = extras
+        
+        super.init()
+        self.fileType = resolvedFileType
+        self.delegate = coordinator
+    }
+    
+    static func resolveUTI(for item: MTPObjectItem) -> String {
+        if item.isFolder {
+            return UTType.folder.identifier
+        }
+        let ext = (item.filename as NSString).pathExtension.lowercased()
+        if !ext.isEmpty, let utType = UTType(filenameExtension: ext) {
+            return utType.identifier
+        }
+        if item.isImage {
+            return UTType.jpeg.identifier
+        }
+        if item.isVideo {
+            return UTType.mpeg4Movie.identifier
+        }
+        return UTType.data.identifier
+    }
+    
+    override func writableTypes(for pasteboard: NSPasteboard) -> [NSPasteboard.PasteboardType] {
+        var types = super.writableTypes(for: pasteboard)
+        for extra in extraPromisedTypes where !types.contains(extra) {
+            types.append(extra)
+        }
+        return types
+    }
+    
+    override func writingOptions(forType type: NSPasteboard.PasteboardType, pasteboard: NSPasteboard) -> NSPasteboard.WritingOptions {
+        if extraPromisedTypes.contains(type) {
+            return .promised
+        }
+        return super.writingOptions(forType: type, pasteboard: pasteboard)
+    }
+    
+    override func pasteboardPropertyList(forType type: NSPasteboard.PasteboardType) -> Any? {
+        if !extraPromisedTypes.contains(type) {
+            return super.pasteboardPropertyList(forType: type)
+        }
+        guard let coordinator else { return nil }
+        
+        if type == .fileURL {
+            if let existingURL = coordinator.existingCachedFileURL(for: item) {
+                return (existingURL as NSURL).pasteboardPropertyList(forType: .fileURL)
+            }
+            return nil
+        }
+        
+        if type == .tiff {
+            if let existingURL = coordinator.existingCachedFileURL(for: item),
+               let data = try? Data(contentsOf: existingURL),
+               let image = NSImage(data: data) {
+                return image.tiffRepresentation
+            }
+            if let fallback = cachedImageFallback {
+                return fallback.tiffRepresentation
+            }
+            return nil
+        }
+        
+        return super.pasteboardPropertyList(forType: type)
+    }
+}
+
+nonisolated final class MTPDragExportCoordinator: NSObject, NSFilePromiseProviderDelegate, @unchecked Sendable {
+    let client: MTPUSBClient
+    nonisolated(unsafe) weak var viewModel: MTPViewModel?
+    
+    private let filePromiseQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "me.podter.SwitchMTP.filePromiseQueue"
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .userInitiated
+        return queue
+    }()
+    
+    private let batchLock = NSLock()
+    private var batchTotalCount: Int = 0
+    private var batchCompletedCount: Int = 0
+    
+    init(client: MTPUSBClient, viewModel: MTPViewModel) {
+        self.client = client
+        self.viewModel = viewModel
+        super.init()
+    }
+    
+    func prepareForDragBatch(items: [MTPObjectItem]) {
+        batchLock.lock()
+        batchTotalCount = items.count
+        batchCompletedCount = 0
+        batchLock.unlock()
+    }
+    
+    func makeFilePromiseProvider(for item: MTPObjectItem, cachedImage: NSImage? = nil) -> MTPFilePromiseProvider {
+        MTPFilePromiseProvider(item: item, coordinator: self, cachedImageFallback: cachedImage)
+    }
+    
+    // MARK: - NSFilePromiseProviderDelegate
+    
+    func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
+        guard let provider = filePromiseProvider as? MTPFilePromiseProvider else {
+            return "SwitchMedia"
+        }
+        return MTPViewModel.sanitizeFilename(provider.item.filename)
+    }
+    
+    func operationQueue(for filePromiseProvider: NSFilePromiseProvider) -> OperationQueue {
+        filePromiseQueue
+    }
+    
+    nonisolated func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider,
+        writePromiseTo url: URL,
+        completionHandler: @escaping @Sendable ((any Error)?) -> Void
+    ) {
+        guard let provider = filePromiseProvider as? MTPFilePromiseProvider else {
+            completionHandler(MTPError.invalidData)
+            return
+        }
+        do {
+            try fulfillPromiseBlocking(for: provider.item, destinationURL: url)
+            completionHandler(nil)
+        } catch {
+            Task { @MainActor [weak self] in
+                self?.viewModel?.setTransferStateFromDrag(isTransferring: false, status: nil)
+                self?.viewModel?.errorMessage = "Drag export failed: \(error.localizedDescription)"
+            }
+            completionHandler(error)
+        }
+    }
+    
+    // MARK: - Transfer & Materialization Helpers
+    
+    nonisolated func existingCachedFileURL(for item: MTPObjectItem) -> URL? {
+        guard !item.isFolder else { return nil }
+        let fm = FileManager.default
+        let sanitized = MTPViewModel.sanitizeFilename(item.filename)
+        let candidateDirs = [
+            fm.temporaryDirectory.appendingPathComponent("SwitchMTPPreview", isDirectory: true),
+            fm.temporaryDirectory.appendingPathComponent("SwitchMTPQuickOpen", isDirectory: true),
+            fm.temporaryDirectory.appendingPathComponent("SwitchMTPDragDrop", isDirectory: true)
+        ]
+        for dir in candidateDirs {
+            let candidate = dir.appendingPathComponent(sanitized)
+            if fm.fileExists(atPath: candidate.path),
+               let attrs = try? fm.attributesOfItem(atPath: candidate.path),
+               let fileSize = attrs[.size] as? UInt64,
+               fileSize > 0,
+               (item.compressedSize == 0 || fileSize == item.compressedSize) {
+                return candidate
+            }
+        }
+        return nil
+    }
+    
+    nonisolated func materializeToTempURLBlocking(for item: MTPObjectItem) throws -> URL {
+        if let existing = existingCachedFileURL(for: item) {
+            return existing
+        }
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SwitchMTPDragDrop", isDirectory: true)
+        let destURL = tempDir.appendingPathComponent(MTPViewModel.sanitizeFilename(item.filename))
+        try fulfillPromiseBlocking(for: item, destinationURL: destURL, showCompletionBanner: false)
+        return destURL
+    }
+    
+    nonisolated func materializeDataBlocking(for item: MTPObjectItem) throws -> Data {
+        if let existing = existingCachedFileURL(for: item),
+           let data = try? Data(contentsOf: existing) {
+            return data
+        }
+        let tempURL = try materializeToTempURLBlocking(for: item)
+        return try Data(contentsOf: tempURL)
+    }
+    
+    nonisolated private func fulfillPromiseBlocking(
+        for item: MTPObjectItem,
+        destinationURL: URL,
+        showCompletionBanner: Bool = true
+    ) throws {
+        batchLock.lock()
+        let currentIndex = batchCompletedCount
+        let totalCount = max(1, batchTotalCount)
+        batchLock.unlock()
+        
+        let fm = FileManager.default
+        let startTime = CFAbsoluteTimeGetCurrent()
+        
+        if item.isFolder {
+            if !fm.fileExists(atPath: destinationURL.path) {
+                try fm.createDirectory(at: destinationURL, withIntermediateDirectories: true)
+            }
+            let children = try client.fetchDirectoryItemsBlocking(
+                storageID: item.storageID,
+                parentHandle: item.handle,
+                folderName: item.filename,
+                includeChildCountsForFolders: false
+            )
+            let mediaChildren = children.filter { !$0.isFolder }
+            var cumulativeBytes: Int64 = 0
+            
+            for (idx, child) in mediaChildren.enumerated() {
+                let childURL = destinationURL.appendingPathComponent(MTPViewModel.sanitizeFilename(child.filename))
+                let title = "Exporting \"\(item.filename)\" (\(idx + 1)/\(mediaChildren.count))…"
+                
+                Task { @MainActor [weak self] in
+                    self?.viewModel?.setTransferStateFromDrag(
+                        isTransferring: true,
+                        status: TransferStatus(
+                            title: title,
+                            currentFile: child.filename,
+                            completedFiles: idx,
+                            totalFiles: mediaChildren.count,
+                            currentBytes: 0,
+                            totalBytes: Int64(child.compressedSize),
+                            bytesPerSecond: 0
+                        )
+                    )
+                }
+                
+                if let cached = existingCachedFileURL(for: child) {
+                    if fm.fileExists(atPath: childURL.path) {
+                        try? fm.removeItem(at: childURL)
+                    }
+                    try fm.copyItem(at: cached, to: childURL)
+                } else {
+                    let baseCumulative = cumulativeBytes
+                    try client.downloadObjectToFileBlocking(item: child, destinationURL: childURL) { [weak self] current, total in
+                        let elapsed = max(0.001, CFAbsoluteTimeGetCurrent() - startTime)
+                        let speed = Double(baseCumulative + current) / elapsed
+                        Task { @MainActor [weak self] in
+                            self?.viewModel?.setTransferStateFromDrag(
+                                isTransferring: true,
+                                status: TransferStatus(
+                                    title: title,
+                                    currentFile: child.filename,
+                                    completedFiles: idx,
+                                    totalFiles: mediaChildren.count,
+                                    currentBytes: current,
+                                    totalBytes: total,
+                                    bytesPerSecond: speed
+                                )
+                            )
+                        }
+                    }
+                }
+                cumulativeBytes += Int64(child.compressedSize)
+            }
+        } else {
+            let parentDir = destinationURL.deletingLastPathComponent()
+            if !fm.fileExists(atPath: parentDir.path) {
+                try fm.createDirectory(at: parentDir, withIntermediateDirectories: true)
+            }
+            
+            let title = totalCount == 1
+                ? "Exporting File…"
+                : "Exporting \(min(totalCount, currentIndex + 1)) of \(totalCount)…"
+            
+            Task { @MainActor [weak self] in
+                self?.viewModel?.setTransferStateFromDrag(
+                    isTransferring: true,
+                    status: TransferStatus(
+                        title: title,
+                        currentFile: item.filename,
+                        completedFiles: currentIndex,
+                        totalFiles: totalCount,
+                        currentBytes: 0,
+                        totalBytes: Int64(item.compressedSize),
+                        bytesPerSecond: 0
+                    )
+                )
+            }
+            
+            if let cached = existingCachedFileURL(for: item), cached.standardizedFileURL != destinationURL.standardizedFileURL {
+                if fm.fileExists(atPath: destinationURL.path) {
+                    try fm.removeItem(at: destinationURL)
+                }
+                try fm.copyItem(at: cached, to: destinationURL)
+            } else {
+                try client.downloadObjectToFileBlocking(item: item, destinationURL: destinationURL) { [weak self] current, total in
+                    let elapsed = max(0.001, CFAbsoluteTimeGetCurrent() - startTime)
+                    let speed = Double(current) / elapsed
+                    Task { @MainActor [weak self] in
+                        self?.viewModel?.setTransferStateFromDrag(
+                            isTransferring: true,
+                            status: TransferStatus(
+                                title: title,
+                                currentFile: item.filename,
+                                completedFiles: currentIndex,
+                                totalFiles: totalCount,
+                                currentBytes: current,
+                                totalBytes: total,
+                                bytesPerSecond: speed
+                            )
+                        )
+                    }
+                }
+            }
+        }
+        
+        batchLock.lock()
+        batchCompletedCount += 1
+        let finishedAll = batchCompletedCount >= max(1, batchTotalCount)
+        let finalCount = max(1, batchCompletedCount)
+        if finishedAll {
+            batchTotalCount = 0
+            batchCompletedCount = 0
+        }
+        batchLock.unlock()
+        
+        if finishedAll {
+            let folderDisplayName = destinationURL.deletingLastPathComponent().lastPathComponent
+            Task { @MainActor [weak self] in
+                guard let self, let vm = self.viewModel else { return }
+                vm.setTransferStateFromDrag(isTransferring: false, status: nil)
+                if showCompletionBanner {
+                    if item.isFolder && finalCount == 1 {
+                        vm.showTemporaryBanner("Exported folder \"\(item.filename)\" to \"\(folderDisplayName)\"")
+                    } else {
+                        vm.showTemporaryBanner("Exported \(finalCount) item\(finalCount == 1 ? "" : "s") to \"\(folderDisplayName)\"")
+                    }
+                }
+            }
+        }
     }
 }

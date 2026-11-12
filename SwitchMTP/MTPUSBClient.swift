@@ -12,6 +12,7 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
     static let switchMTPProductID = 0x201D
     
     private let usbQueue = DispatchQueue(label: "me.podter.SwitchMTP.usbQueue", qos: .userInitiated)
+    private static let usbQueueSpecificKey = DispatchSpecificKey<Bool>()
     
     private var hostInterface: IOUSBHostInterface?
     private var pipeIn: IOUSBHostPipe?
@@ -22,7 +23,9 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
     private var lastDrainedTransactionID: UInt32 = 0
     private var isSessionOpen: Bool = false
     
-    init() {}
+    init() {
+        usbQueue.setSpecific(key: Self.usbQueueSpecificKey, value: true)
+    }
     
     static func isSwitchPresentInRegistry() -> Bool {
         guard let matching = IOServiceMatching("IOUSBHostInterface") else { return false }
@@ -65,6 +68,15 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
                     continuation.resume(throwing: error)
                 }
             }
+        }
+    }
+    
+    private func runOnUSBQueueSync<T>(_ block: () throws -> T) throws -> T {
+        if DispatchQueue.getSpecific(key: Self.usbQueueSpecificKey) == true {
+            return try block()
+        }
+        return try usbQueue.sync {
+            try block()
         }
     }
     
@@ -533,38 +545,92 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
         progress: (@Sendable (Int64, Int64) -> Void)? = nil
     ) async throws {
         try await runOnUSBQueue {
-            let fm = FileManager.default
-            let parentDir = destinationURL.deletingLastPathComponent()
-            if !fm.fileExists(atPath: parentDir.path) {
-                try fm.createDirectory(at: parentDir, withIntermediateDirectories: true)
+            try self.downloadObjectToFileOnQueue(item: item, destinationURL: destinationURL, progress: progress)
+        }
+    }
+    
+    func fetchDirectoryItemsBlocking(
+        storageID: UInt32,
+        parentHandle: UInt32,
+        folderName: String = "",
+        includeChildCountsForFolders: Bool = false
+    ) throws -> [MTPObjectItem] {
+        try runOnUSBQueueSync {
+            let handles = try self.fetchObjectHandlesSync(storageID: storageID, parentHandle: parentHandle)
+            var items: [MTPObjectItem] = []
+            items.reserveCapacity(handles.count)
+            for handle in handles {
+                var item = try self.fetchObjectInfoSync(handle: handle, folderName: folderName)
+                if item.isFolder && includeChildCountsForFolders {
+                    if let childHandles = try? self.fetchObjectHandlesSync(storageID: storageID, parentHandle: handle) {
+                        item.childCount = childHandles.count
+                    }
+                }
+                items.append(item)
             }
-            if fm.fileExists(atPath: destinationURL.path) {
-                try fm.removeItem(at: destinationURL)
+            return items
+        }
+    }
+    
+    func fetchObjectDataBlocking(
+        handle: UInt32,
+        progress: (@Sendable (Int64, Int64) -> Void)? = nil
+    ) throws -> Data {
+        try runOnUSBQueueSync {
+            let resp = try self.executeCommandSync(.getObject, parameters: [handle], timeout: 30.0, progress: progress)
+            guard resp.responseCode == MTPResponseCode.ok.rawValue else {
+                throw MTPError.unexpectedResponse(MTPResponseCode(rawValue: resp.responseCode), resp.responseCode)
             }
-            fm.createFile(atPath: destinationURL.path, contents: nil)
-            let fileHandle = try FileHandle(forWritingTo: destinationURL)
-            defer {
-                try? fileHandle.close()
-            }
-            
-            let respCode = try self.streamCommandToFileSync(
-                .getObject,
-                parameters: [item.handle],
-                fileHandle: fileHandle,
-                timeout: 30.0,
-                progress: progress
-            )
-            guard respCode == MTPResponseCode.ok.rawValue else {
-                try? fm.removeItem(at: destinationURL)
-                throw MTPError.unexpectedResponse(MTPResponseCode(rawValue: respCode), respCode)
-            }
-            
-            if let date = item.displayDate {
-                try? fm.setAttributes([
-                    .creationDate: date,
-                    .modificationDate: date
-                ], ofItemAtPath: destinationURL.path)
-            }
+            return resp.data
+        }
+    }
+    
+    func downloadObjectToFileBlocking(
+        item: MTPObjectItem,
+        destinationURL: URL,
+        progress: (@Sendable (Int64, Int64) -> Void)? = nil
+    ) throws {
+        try runOnUSBQueueSync {
+            try self.downloadObjectToFileOnQueue(item: item, destinationURL: destinationURL, progress: progress)
+        }
+    }
+    
+    private func downloadObjectToFileOnQueue(
+        item: MTPObjectItem,
+        destinationURL: URL,
+        progress: (@Sendable (Int64, Int64) -> Void)? = nil
+    ) throws {
+        let fm = FileManager.default
+        let parentDir = destinationURL.deletingLastPathComponent()
+        if !fm.fileExists(atPath: parentDir.path) {
+            try fm.createDirectory(at: parentDir, withIntermediateDirectories: true)
+        }
+        if fm.fileExists(atPath: destinationURL.path) {
+            try fm.removeItem(at: destinationURL)
+        }
+        fm.createFile(atPath: destinationURL.path, contents: nil)
+        let fileHandle = try FileHandle(forWritingTo: destinationURL)
+        defer {
+            try? fileHandle.close()
+        }
+        
+        let respCode = try self.streamCommandToFileSync(
+            .getObject,
+            parameters: [item.handle],
+            fileHandle: fileHandle,
+            timeout: 30.0,
+            progress: progress
+        )
+        guard respCode == MTPResponseCode.ok.rawValue else {
+            try? fm.removeItem(at: destinationURL)
+            throw MTPError.unexpectedResponse(MTPResponseCode(rawValue: respCode), respCode)
+        }
+        
+        if let date = item.displayDate {
+            try? fm.setAttributes([
+                .creationDate: date,
+                .modificationDate: date
+            ], ofItemAtPath: destinationURL.path)
         }
     }
     
@@ -708,6 +774,7 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
         
         let tx = transactionID
         transactionID &+= 1
+        UserDefaults.standard.set(Int(transactionID), forKey: "SwitchMTP.lastTransactionID")
         
         let cmdData = Self.makeCommandPacket(code: op.rawValue, transactionID: tx, parameters: parameters)
         let outBuf = NSMutableData(data: cmdData)

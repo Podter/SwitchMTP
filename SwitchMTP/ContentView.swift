@@ -614,9 +614,8 @@ private struct MediaGridView: View {
             LazyVGrid(columns: columns, alignment: .leading, spacing: spacing) {
                 ForEach(viewModel.filteredAndSortedItems) { item in
                     MediaGridCard(
+                        viewModel: viewModel,
                         item: item,
-                        thumbnail: viewModel.thumbnails[item.handle],
-                        isSelected: viewModel.selectedItemIDs.contains(item.handle),
                         showGameTag: showGameTag,
                         thumbHeight: thumbHeight,
                         onPlay: { viewModel.openItem(item) }
@@ -624,37 +623,27 @@ private struct MediaGridView: View {
                     .onAppear {
                         viewModel.requestThumbnailIfNeeded(for: item)
                     }
-                    .onTapGesture(count: 2) {
-                        viewModel.openItem(item)
-                    }
-                    .simultaneousGesture(
-                        TapGesture(count: 1).onEnded {
-                            let flags = NSEvent.modifierFlags
-                            if flags.contains(.command) {
-                                if viewModel.selectedItemIDs.contains(item.handle) {
-                                    viewModel.selectedItemIDs.remove(item.handle)
-                                } else {
-                                    viewModel.selectedItemIDs.insert(item.handle)
-                                }
-                            } else {
-                                viewModel.selectedItemIDs = [item.handle]
-                            }
-                        }
-                    )
-                    .contextMenu {
-                        ItemContextMenu(viewModel: viewModel, item: item)
-                    }
                 }
             }
             .padding(horizontalPadding)
             .animation(.snappy(duration: 0.2), value: columnCount)
         }
         .onGeometryChange(for: CGFloat.self) { proxy in
-            proxy.size.width
+            floor(proxy.size.width)
         } action: { newWidth in
-            if abs(newWidth - containerWidth) > 0.5 {
+            if newWidth > 100, abs(newWidth - containerWidth) > 1.0 {
                 containerWidth = newWidth
             }
+        }
+        .overlay {
+            GridInteractionOverlay(
+                viewModel: viewModel,
+                columnCount: columnCount,
+                itemWidth: itemWidth,
+                thumbHeight: thumbHeight,
+                spacing: spacing,
+                horizontalPadding: horizontalPadding
+            )
         }
         .background(Color(nsColor: .textBackgroundColor))
         .onExitCommand {
@@ -663,15 +652,430 @@ private struct MediaGridView: View {
     }
 }
 
+private struct GridInteractionOverlay: NSViewRepresentable {
+    var viewModel: MTPViewModel
+    var columnCount: Int
+    var itemWidth: CGFloat
+    var thumbHeight: CGFloat
+    var spacing: CGFloat
+    var horizontalPadding: CGFloat
+
+    func makeNSView(context: Context) -> GridInteractionNSView {
+        let view = GridInteractionNSView()
+        configure(view)
+        return view
+    }
+
+    func updateNSView(_ nsView: GridInteractionNSView, context: Context) {
+        configure(nsView)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: GridInteractionNSView, context: Context) -> CGSize {
+        CGSize(width: proposal.width ?? 0, height: proposal.height ?? 0)
+    }
+
+    private func configure(_ view: GridInteractionNSView) {
+        view.viewModel = viewModel
+        view.columnCount = max(1, columnCount)
+        view.itemWidth = itemWidth
+        view.thumbHeight = thumbHeight
+        view.spacing = spacing
+        view.horizontalPadding = horizontalPadding
+    }
+}
+
+private final class GridInteractionNSView: NSView, NSDraggingSource {
+    weak var viewModel: MTPViewModel?
+    var columnCount: Int = 4
+    var itemWidth: CGFloat = 180
+    var thumbHeight: CGFloat = 100
+    var spacing: CGFloat = 16
+    var horizontalPadding: CGFloat = 20
+
+    private weak var cachedScrollView: NSScrollView?
+    private var activeMarqueeRect: CGRect? = nil {
+        didSet {
+            if oldValue != activeMarqueeRect {
+                needsDisplay = true
+            }
+        }
+    }
+    private var mouseDownViewportPoint: CGPoint = .zero
+    private var marqueeStartContentPoint: CGPoint = .zero
+    private var dragCandidateItem: MTPObjectItem? = nil
+    private var pendingSingleSelectHandle: UInt32? = nil
+    private var clickedPlayButtonItem: MTPObjectItem? = nil
+    private var hasStartedFileDrag: Bool = false
+    private var isMarqueeSelecting: Bool = false
+    private var marqueeInitialSelection: Set<UInt32> = []
+    private var contextMenuActionTargets: [ContextMenuActionTarget] = []
+
+    override var isFlipped: Bool { true }
+    override var acceptsFirstResponder: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let rect = activeMarqueeRect, rect.width > 1 || rect.height > 1 else { return }
+        NSColor.controlAccentColor.withAlphaComponent(0.18).setFill()
+        rect.fill()
+        NSColor.controlAccentColor.withAlphaComponent(0.85).setStroke()
+        let path = NSBezierPath(rect: rect.insetBy(dx: 0.5, dy: 0.5))
+        path.lineWidth = 1.0
+        path.stroke()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard bounds.contains(point) else { return nil }
+        // Let clicks on the right-hand vertical scrollbar pass through to NSScrollView
+        if point.x >= bounds.width - 15 {
+            return nil
+        }
+        return self
+    }
+
+    private func backingScrollView() -> NSScrollView? {
+        if let cachedScrollView, cachedScrollView.window != nil {
+            return cachedScrollView
+        }
+        func findScrollView(in root: NSView) -> NSScrollView? {
+            if let sv = root as? NSScrollView {
+                return sv
+            }
+            for sub in root.subviews where sub !== self {
+                if let found = findScrollView(in: sub) {
+                    return found
+                }
+            }
+            return nil
+        }
+        var ancestor = superview
+        while let current = ancestor {
+            if let found = findScrollView(in: current) {
+                cachedScrollView = found
+                return found
+            }
+            ancestor = current.superview
+        }
+        return nil
+    }
+
+    private var currentScrollOffsetY: CGFloat {
+        guard let sv = backingScrollView() else { return 0 }
+        return max(0, sv.contentView.bounds.origin.y)
+    }
+
+    private func autoScrollViewportIfNeeded(at viewportPoint: CGPoint) {
+        guard let sv = backingScrollView(), let docView = sv.documentView else { return }
+        let edgeZone: CGFloat = 36
+        var deltaY: CGFloat = 0
+        if viewportPoint.y < edgeZone {
+            deltaY = -max(4, (edgeZone - viewportPoint.y) * 0.45)
+        } else if viewportPoint.y > bounds.height - edgeZone {
+            deltaY = max(4, (viewportPoint.y - (bounds.height - edgeZone)) * 0.45)
+        }
+        guard abs(deltaY) > 0.5 else { return }
+        let clipView = sv.contentView
+        let maxScrollY = max(0, docView.bounds.height - clipView.bounds.height)
+        let newY = min(maxScrollY, max(0, clipView.bounds.origin.y + deltaY))
+        if abs(newY - clipView.bounds.origin.y) > 0.5 {
+            clipView.scroll(to: NSPoint(x: clipView.bounds.origin.x, y: newY))
+            sv.reflectScrolledClipView(clipView)
+        }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        if let sv = backingScrollView() {
+            sv.scrollWheel(with: event)
+        } else {
+            super.scrollWheel(with: event)
+        }
+    }
+
+    private var cardHeight: CGFloat {
+        thumbHeight + 42
+    }
+
+    private func resolvedContentFrame(at index: Int) -> CGRect {
+        let cols = max(1, columnCount)
+        let col = index % cols
+        let row = index / cols
+        let cardH = cardHeight
+        return CGRect(
+            x: horizontalPadding + CGFloat(col) * (itemWidth + spacing),
+            y: horizontalPadding + CGFloat(row) * (cardH + spacing),
+            width: itemWidth,
+            height: cardH
+        )
+    }
+
+    private func itemAt(contentPoint: CGPoint) -> (item: MTPObjectItem, contentFrame: CGRect)? {
+        guard let viewModel else { return nil }
+        for (index, item) in viewModel.filteredAndSortedItems.enumerated() {
+            let frame = resolvedContentFrame(at: index)
+            guard frame.contains(contentPoint) else { continue }
+            let thumbRect = CGRect(x: frame.minX, y: frame.minY, width: frame.width, height: thumbHeight)
+            let labelRect = CGRect(
+                x: frame.minX,
+                y: frame.minY + thumbHeight,
+                width: min(frame.width, 160),
+                height: max(0, frame.height - thumbHeight)
+            )
+            if thumbRect.contains(contentPoint) || labelRect.contains(contentPoint) {
+                return (item, frame)
+            }
+        }
+        return nil
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        guard let viewModel else { return }
+
+        let viewportPt = convert(event.locationInWindow, from: nil)
+        let contentPt = CGPoint(x: viewportPt.x, y: viewportPt.y + currentScrollOffsetY)
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        mouseDownViewportPoint = viewportPt
+        marqueeStartContentPoint = contentPt
+        hasStartedFileDrag = false
+        clickedPlayButtonItem = nil
+
+        if let hit = itemAt(contentPoint: contentPt) {
+            let item = hit.item
+            let frame = hit.contentFrame
+
+            if event.clickCount >= 2 {
+                dragCandidateItem = nil
+                pendingSingleSelectHandle = nil
+                isMarqueeSelecting = false
+                activeMarqueeRect = nil
+                viewModel.openItem(item)
+                return
+            }
+
+            if item.isVideo {
+                let playRect = CGRect(
+                    x: frame.maxX - 36,
+                    y: frame.minY + max(0, thumbHeight - 36),
+                    width: 36,
+                    height: 36
+                )
+                if playRect.contains(contentPt) {
+                    clickedPlayButtonItem = item
+                }
+            }
+
+            isMarqueeSelecting = false
+            activeMarqueeRect = nil
+            dragCandidateItem = item
+
+            if flags.contains(.command) {
+                if viewModel.selectedItemIDs.contains(item.handle) {
+                    viewModel.selectedItemIDs.remove(item.handle)
+                } else {
+                    viewModel.selectedItemIDs.insert(item.handle)
+                    viewModel.selectionAnchorHandle = item.handle
+                }
+                pendingSingleSelectHandle = nil
+            } else if flags.contains(.shift) {
+                viewModel.selectRange(to: item.handle, additive: false)
+                pendingSingleSelectHandle = nil
+            } else {
+                if viewModel.selectedItemIDs.contains(item.handle) {
+                    pendingSingleSelectHandle = item.handle
+                } else {
+                    viewModel.selectedItemIDs = [item.handle]
+                    viewModel.selectionAnchorHandle = item.handle
+                    pendingSingleSelectHandle = nil
+                }
+            }
+        } else {
+            dragCandidateItem = nil
+            pendingSingleSelectHandle = nil
+            isMarqueeSelecting = true
+            if flags.contains(.command) || flags.contains(.shift) {
+                marqueeInitialSelection = viewModel.selectedItemIDs
+            } else {
+                viewModel.clearSelection()
+                marqueeInitialSelection = []
+            }
+            activeMarqueeRect = nil
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let viewModel else { return }
+        let viewportPt = convert(event.locationInWindow, from: nil)
+        let distance = hypot(viewportPt.x - mouseDownViewportPoint.x, viewportPt.y - mouseDownViewportPoint.y)
+
+        if let candidate = dragCandidateItem {
+            guard !hasStartedFileDrag, distance >= 4.0 else { return }
+            hasStartedFileDrag = true
+            pendingSingleSelectHandle = nil
+            clickedPlayButtonItem = nil
+            startFileDragSession(with: event, primaryItem: candidate)
+        } else if isMarqueeSelecting {
+            guard distance >= 2.0 else { return }
+            autoScrollViewportIfNeeded(at: viewportPt)
+            let scrollY = currentScrollOffsetY
+            let currentContentPt = CGPoint(x: viewportPt.x, y: viewportPt.y + scrollY)
+            let contentRect = CGRect(
+                x: min(marqueeStartContentPoint.x, currentContentPt.x),
+                y: min(marqueeStartContentPoint.y, currentContentPt.y),
+                width: max(1, abs(currentContentPt.x - marqueeStartContentPoint.x)),
+                height: max(1, abs(currentContentPt.y - marqueeStartContentPoint.y))
+            )
+            let viewportBandRect = contentRect.offsetBy(dx: 0, dy: -scrollY).intersection(bounds)
+            if viewportBandRect.isNull || viewportBandRect.isEmpty {
+                activeMarqueeRect = nil
+            } else {
+                activeMarqueeRect = viewportBandRect
+            }
+
+            var intersected: Set<UInt32> = []
+            for (index, item) in viewModel.filteredAndSortedItems.enumerated() {
+                let frame = resolvedContentFrame(at: index)
+                if frame.intersects(contentRect) {
+                    intersected.insert(item.handle)
+                }
+            }
+
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let updatedSelection: Set<UInt32>
+            if flags.contains(.command) {
+                updatedSelection = marqueeInitialSelection.symmetricDifference(intersected)
+            } else if flags.contains(.shift) {
+                updatedSelection = marqueeInitialSelection.union(intersected)
+            } else {
+                updatedSelection = intersected
+            }
+
+            if viewModel.selectedItemIDs != updatedSelection {
+                viewModel.selectedItemIDs = updatedSelection
+            }
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if !hasStartedFileDrag {
+            if let playItem = clickedPlayButtonItem {
+                viewModel?.openItem(playItem)
+            } else if let pending = pendingSingleSelectHandle {
+                viewModel?.selectedItemIDs = [pending]
+                viewModel?.selectionAnchorHandle = pending
+            }
+        }
+        dragCandidateItem = nil
+        pendingSingleSelectHandle = nil
+        clickedPlayButtonItem = nil
+        hasStartedFileDrag = false
+        if isMarqueeSelecting {
+            isMarqueeSelecting = false
+            activeMarqueeRect = nil
+        }
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard let viewModel else { return nil }
+        let viewportPt = convert(event.locationInWindow, from: nil)
+        let contentPt = CGPoint(x: viewportPt.x, y: viewportPt.y + currentScrollOffsetY)
+        guard let hit = itemAt(contentPoint: contentPt) else { return nil }
+        let item = hit.item
+
+        if !viewModel.selectedItemIDs.contains(item.handle) {
+            viewModel.selectedItemIDs = [item.handle]
+            viewModel.selectionAnchorHandle = item.handle
+        }
+
+        let targetItems = viewModel.selectedItems.isEmpty ? [item] : viewModel.selectedItems
+        let built = BrowserContextMenuBuilder.makeMenu(for: targetItems, viewModel: viewModel)
+        contextMenuActionTargets = built.targets
+        return built.menu
+    }
+
+    override func selectAll(_ sender: Any?) {
+        viewModel?.selectAll()
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        viewModel?.clearSelection()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 49 || event.keyCode == 36 { // Space or Return
+            if let first = viewModel?.selectedItems.first {
+                viewModel?.openItem(first)
+                return
+            }
+        }
+        super.keyDown(with: event)
+    }
+
+    // MARK: - NSDraggingSource
+
+    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        context == .outsideApplication ? .copy : []
+    }
+
+    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        dragCandidateItem = nil
+        pendingSingleSelectHandle = nil
+        clickedPlayButtonItem = nil
+        hasStartedFileDrag = false
+        isMarqueeSelecting = false
+        activeMarqueeRect = nil
+    }
+
+    private func startFileDragSession(with event: NSEvent, primaryItem: MTPObjectItem) {
+        guard let viewModel else { return }
+        let itemsToDrag = viewModel.itemsForDrag(startingWith: primaryItem)
+        guard !itemsToDrag.isEmpty else { return }
+
+        viewModel.dragCoordinator.prepareForDragBatch(items: itemsToDrag)
+
+        let scrollY = currentScrollOffsetY
+        var draggingItems: [NSDraggingItem] = []
+        draggingItems.reserveCapacity(itemsToDrag.count)
+
+        for item in itemsToDrag {
+            let thumb = viewModel.thumbnails[item.handle]
+            let provider = viewModel.dragCoordinator.makeFilePromiseProvider(for: item, cachedImage: thumb)
+            let dragItem = NSDraggingItem(pasteboardWriter: provider)
+
+            let itemIndex = viewModel.filteredAndSortedItems.firstIndex(where: { $0.handle == item.handle }) ?? 0
+            let cardFrame = resolvedContentFrame(at: itemIndex).offsetBy(dx: 0, dy: -scrollY)
+            let previewWidth = min(max(96, cardFrame.width), 168)
+            let previewHeight = round(previewWidth * 9.0 / 16.0)
+            let previewSize = NSSize(width: previewWidth, height: previewHeight)
+            let dragOrigin = CGPoint(
+                x: cardFrame.minX + (cardFrame.width - previewWidth) * 0.5,
+                y: cardFrame.minY + max(0, (thumbHeight - previewHeight) * 0.5)
+            )
+            let dragFrame = NSRect(origin: dragOrigin, size: previewSize)
+            let dragImage = DragPreviewRenderer.makeDragImage(
+                for: item,
+                thumbnail: thumb,
+                size: previewSize
+            )
+            dragItem.setDraggingFrame(dragFrame, contents: dragImage)
+            draggingItems.append(dragItem)
+        }
+
+        let session = beginDraggingSession(with: draggingItems, event: event, source: self)
+        session.animatesToStartingPositionsOnCancelOrFail = true
+        session.draggingFormation = .default
+    }
+}
+
 private struct MediaGridCard: View {
+    var viewModel: MTPViewModel
     let item: MTPObjectItem
-    let thumbnail: NSImage?
-    let isSelected: Bool
     let showGameTag: Bool
     let thumbHeight: CGFloat
     let onPlay: () -> Void
 
     var body: some View {
+        let thumbnail = viewModel.thumbnails[item.handle]
+        let isSelected = viewModel.selectedItemIDs.contains(item.handle)
+
         VStack(alignment: .leading, spacing: 6) {
             ZStack(alignment: .bottomTrailing) {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -733,6 +1137,7 @@ private struct MediaGridCard: View {
                     .lineLimit(1)
             }
             .padding(.horizontal, 2)
+            .frame(height: 36, alignment: .topLeading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
@@ -765,159 +1170,781 @@ private struct MediaGridCard: View {
     }
 }
 
-// MARK: - Table View
+// MARK: - Table View (Finder-Style List View with Marquee Selection & File Promises)
 
 private struct MediaTableView: View {
     @Bindable var viewModel: MTPViewModel
 
     var body: some View {
-        Table(viewModel.filteredAndSortedItems, selection: $viewModel.selectedItemIDs) {
-            TableColumn("Name") { item in
-                HStack(spacing: 10) {
-                    if item.isFolder {
-                        Image(systemName: "folder.fill")
-                            .foregroundStyle(.tint)
-                            .frame(width: 32, height: 18)
-                    } else if let thumb = viewModel.thumbnails[item.handle] {
-                        RoundedRectangle(cornerRadius: 3, style: .continuous)
-                            .fill(Color.primary.opacity(0.05))
-                            .frame(width: 32, height: 18)
-                            .overlay {
-                                Image(nsImage: thumb)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fit)
-                            }
-                            .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-                    } else {
-                        Image(systemName: item.isVideo ? "video.fill" : "photo.fill")
-                            .foregroundStyle(.secondary)
-                            .frame(width: 32, height: 18)
-                            .onAppear {
-                                viewModel.requestThumbnailIfNeeded(for: item)
-                            }
-                    }
-                    Text(item.filename)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
+        let _ = viewModel.filteredAndSortedItems
+        let _ = viewModel.selectedItemIDs
+        let _ = viewModel.thumbnails.count
+        MediaTableRepresentable(viewModel: viewModel)
+            .onExitCommand {
+                viewModel.clearSelection()
             }
-            .width(min: 180, ideal: 260)
+    }
+}
 
-            TableColumn("Game") { item in
-                Text(item.isFolder ? "—" : (item.folderName.isEmpty ? "—" : item.folderName))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .width(min: 120, ideal: 180)
+private struct MediaTableRepresentable: NSViewRepresentable {
+    var viewModel: MTPViewModel
 
-            TableColumn("Date") { item in
-                if !item.formattedDate.isEmpty {
-                    Text(item.formattedDate)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("—")
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            .width(min: 120, ideal: 150)
+    func makeCoordinator() -> Coordinator {
+        Coordinator(viewModel: viewModel)
+    }
 
-            TableColumn("Kind") { item in
-                Text(item.kindDescription)
-                    .foregroundStyle(.secondary)
-            }
-            .width(min: 80, ideal: 110)
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = true
+        scrollView.backgroundColor = .textBackgroundColor
 
-            TableColumn("Size") { item in
-                Text(item.formattedSize)
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-            }
-            .width(min: 70, ideal: 90)
+        let tableView = FinderStyleTableView()
+        tableView.style = .inset
+        tableView.usesAlternatingRowBackgroundColors = true
+        tableView.rowHeight = 28
+        tableView.intercellSpacing = NSSize(width: 12, height: 2)
+        tableView.allowsMultipleSelection = true
+        tableView.allowsEmptySelection = true
+        tableView.allowsColumnReordering = false
+        tableView.allowsColumnResizing = true
+        tableView.allowsColumnSelection = false
+        tableView.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
+        tableView.setDraggingSourceOperationMask(.copy, forLocal: false)
+        tableView.setDraggingSourceOperationMask([], forLocal: true)
+
+        let columnsConfig: [(id: String, title: String, minW: CGFloat, idealW: CGFloat, maxW: CGFloat)] = [
+            ("name", "Name", 180, 280, 1200),
+            ("game", "Game", 120, 190, 600),
+            ("date", "Date", 120, 150, 400),
+            ("kind", "Kind", 80, 110, 300),
+            ("size", "Size", 70, 90, 240)
+        ]
+
+        for colInfo in columnsConfig {
+            let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(colInfo.id))
+            col.title = colInfo.title
+            col.minWidth = colInfo.minW
+            col.width = colInfo.idealW
+            col.maxWidth = colInfo.maxW
+            col.resizingMask = .userResizingMask
+            tableView.addTableColumn(col)
         }
-        .contextMenu(forSelectionType: UInt32.self) { handles in
-            let items = viewModel.filteredAndSortedItems.filter { handles.contains($0.handle) }
-            if let first = items.first, items.count == 1 {
-                ItemContextMenu(viewModel: viewModel, item: first)
-            } else if !items.isEmpty {
-                Button {
-                    viewModel.quickSaveToDownloads(items)
-                } label: {
-                    Label("Save \(items.count) Items to Downloads", systemImage: "arrow.down.circle")
-                }
-                Button {
-                    viewModel.promptAndExportItems(items)
-                } label: {
-                    Label("Export \(items.count) Items…", systemImage: "folder")
+
+        let coordinator = context.coordinator
+        coordinator.tableView = tableView
+        tableView.coordinator = coordinator
+        tableView.delegate = coordinator
+        tableView.dataSource = coordinator
+
+        scrollView.documentView = tableView
+        coordinator.syncFromViewModel()
+        return scrollView
+    }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        context.coordinator.viewModel = viewModel
+        context.coordinator.syncFromViewModel()
+    }
+
+    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+        var viewModel: MTPViewModel
+        weak var tableView: FinderStyleTableView?
+        private var displayedItems: [MTPObjectItem] = []
+        private var displayedHandles: [UInt32] = []
+        private var knownThumbnailCount: Int = 0
+        var isProgrammaticSelectionUpdate: Bool = false
+
+        init(viewModel: MTPViewModel) {
+            self.viewModel = viewModel
+            super.init()
+        }
+
+        func syncFromViewModel() {
+            guard let tableView else { return }
+            let newItems = viewModel.filteredAndSortedItems
+            let newHandles = newItems.map(\.handle)
+            let itemsChanged = newHandles != displayedHandles
+            let thumbCount = viewModel.thumbnails.count
+
+            displayedItems = newItems
+            if itemsChanged {
+                displayedHandles = newHandles
+                tableView.reloadData()
+            } else if thumbCount != knownThumbnailCount {
+                let visibleRows = tableView.rows(in: tableView.visibleRect)
+                if visibleRows.length > 0 {
+                    let rowSet = IndexSet(integersIn: visibleRows.location ..< (visibleRows.location + visibleRows.length))
+                    tableView.reloadData(forRowIndexes: rowSet, columnIndexes: IndexSet(integer: 0))
                 }
             }
-        } primaryAction: { handles in
-            if let firstHandle = handles.first,
-               let item = viewModel.filteredAndSortedItems.first(where: { $0.handle == firstHandle }) {
-                viewModel.openItem(item)
+            knownThumbnailCount = thumbCount
+
+            if !tableView.isTrackingMouseInteraction {
+                var targetIndexSet = IndexSet()
+                let selectedIDs = viewModel.selectedItemIDs
+                if !selectedIDs.isEmpty {
+                    for (idx, item) in displayedItems.enumerated() where selectedIDs.contains(item.handle) {
+                        targetIndexSet.insert(idx)
+                    }
+                }
+                if tableView.selectedRowIndexes != targetIndexSet {
+                    isProgrammaticSelectionUpdate = true
+                    tableView.selectRowIndexes(targetIndexSet, byExtendingSelection: false)
+                    isProgrammaticSelectionUpdate = false
+                }
+            }
+        }
+
+        func item(at row: Int) -> MTPObjectItem? {
+            guard displayedItems.indices.contains(row) else { return nil }
+            return displayedItems[row]
+        }
+
+        func pushTableSelectionToViewModel(_ rowIndexes: IndexSet, anchorRow: Int? = nil) {
+            var handles = Set<UInt32>()
+            handles.reserveCapacity(rowIndexes.count)
+            for row in rowIndexes where displayedItems.indices.contains(row) {
+                handles.insert(displayedItems[row].handle)
+            }
+            if let anchorRow, displayedItems.indices.contains(anchorRow) {
+                viewModel.selectionAnchorHandle = displayedItems[anchorRow].handle
+            }
+            if viewModel.selectedItemIDs != handles {
+                viewModel.selectedItemIDs = handles
+            }
+        }
+
+        // MARK: - NSTableViewDataSource & NSTableViewDelegate
+
+        func numberOfRows(in tableView: NSTableView) -> Int {
+            displayedItems.count
+        }
+
+        func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> (any NSPasteboardWriting)? {
+            guard let item = item(at: row) else { return nil }
+            return viewModel.dragCoordinator.makeFilePromiseProvider(
+                for: item,
+                cachedImage: viewModel.thumbnails[item.handle]
+            )
+        }
+
+        func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, willBeginAt screenPoint: NSPoint, forRowIndexes rowIndexes: IndexSet) {
+            let draggedItems = rowIndexes.compactMap { item(at: $0) }
+            viewModel.dragCoordinator.prepareForDragBatch(items: draggedItems)
+        }
+
+        func tableViewSelectionDidChange(_ notification: Notification) {
+            guard !isProgrammaticSelectionUpdate, let tableView else { return }
+            pushTableSelectionToViewModel(tableView.selectedRowIndexes)
+        }
+
+        func tableView(_ tableView: NSTableView, didClick tableColumn: NSTableColumn) {
+            switch tableColumn.identifier.rawValue {
+            case "name":
+                viewModel.sortOrder = .nameAscending
+            case "game":
+                viewModel.sortOrder = .gameTitle
+            case "date":
+                viewModel.sortOrder = (viewModel.sortOrder == .dateNewest) ? .dateOldest : .dateNewest
+            case "size":
+                viewModel.sortOrder = .sizeLargest
+            default:
+                break
+            }
+        }
+
+        func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+            guard let tableColumn, let item = item(at: row) else { return nil }
+            let colID = tableColumn.identifier.rawValue
+
+            if colID == "name" {
+                let id = NSUserInterfaceItemIdentifier("NameCell")
+                let cell: MediaNameTableCellView
+                if let reused = tableView.makeView(withIdentifier: id, owner: nil) as? MediaNameTableCellView {
+                    cell = reused
+                } else {
+                    cell = MediaNameTableCellView()
+                    cell.identifier = id
+                }
+                let thumb = viewModel.thumbnails[item.handle]
+                if thumb == nil && item.hasThumbnail {
+                    let vm = viewModel
+                    DispatchQueue.main.async {
+                        vm.requestThumbnailIfNeeded(for: item)
+                    }
+                }
+                cell.configure(with: item, thumbnail: thumb)
+                return cell
+            } else {
+                let id = NSUserInterfaceItemIdentifier("TextCell_\(colID)")
+                let cell: MediaTextTableCellView
+                if let reused = tableView.makeView(withIdentifier: id, owner: nil) as? MediaTextTableCellView {
+                    cell = reused
+                } else {
+                    cell = MediaTextTableCellView()
+                    cell.identifier = id
+                }
+
+                switch colID {
+                case "game":
+                    let text = item.isFolder ? "—" : (item.folderName.isEmpty ? "—" : item.folderName)
+                    cell.configure(text: text, color: .secondaryLabelColor, monospaced: false)
+                case "date":
+                    if !item.formattedDate.isEmpty {
+                        cell.configure(text: item.formattedDate, color: .secondaryLabelColor, monospaced: false)
+                    } else {
+                        cell.configure(text: "—", color: .tertiaryLabelColor, monospaced: false)
+                    }
+                case "kind":
+                    cell.configure(text: item.kindDescription, color: .secondaryLabelColor, monospaced: false)
+                case "size":
+                    cell.configure(text: item.formattedSize, color: .secondaryLabelColor, monospaced: true)
+                default:
+                    cell.configure(text: "", color: .secondaryLabelColor, monospaced: false)
+                }
+                return cell
             }
         }
     }
 }
 
-private struct ItemContextMenu: View {
-    var viewModel: MTPViewModel
-    let item: MTPObjectItem
+private final class MediaNameTableCellView: NSTableCellView {
+    private let thumbContainer = NSView()
+    private let thumbImageView = NSImageView()
+    private let titleField = NSTextField(labelWithString: "")
 
-    var body: some View {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setupViews()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupViews()
+    }
+
+    private func setupViews() {
+        thumbContainer.translatesAutoresizingMaskIntoConstraints = false
+        thumbContainer.wantsLayer = true
+        thumbContainer.layer?.cornerRadius = 3
+        thumbContainer.layer?.masksToBounds = true
+
+        thumbImageView.translatesAutoresizingMaskIntoConstraints = false
+        thumbImageView.imageScaling = .scaleProportionallyUpOrDown
+
+        titleField.translatesAutoresizingMaskIntoConstraints = false
+        titleField.lineBreakMode = .byTruncatingMiddle
+        titleField.maximumNumberOfLines = 1
+        titleField.font = .systemFont(ofSize: NSFont.systemFontSize)
+        titleField.textColor = .labelColor
+
+        thumbContainer.addSubview(thumbImageView)
+        addSubview(thumbContainer)
+        addSubview(titleField)
+        self.textField = titleField
+
+        NSLayoutConstraint.activate([
+            thumbContainer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            thumbContainer.centerYAnchor.constraint(equalTo: centerYAnchor),
+            thumbContainer.widthAnchor.constraint(equalToConstant: 32),
+            thumbContainer.heightAnchor.constraint(equalToConstant: 18),
+
+            thumbImageView.leadingAnchor.constraint(equalTo: thumbContainer.leadingAnchor),
+            thumbImageView.trailingAnchor.constraint(equalTo: thumbContainer.trailingAnchor),
+            thumbImageView.topAnchor.constraint(equalTo: thumbContainer.topAnchor),
+            thumbImageView.bottomAnchor.constraint(equalTo: thumbContainer.bottomAnchor),
+
+            titleField.leadingAnchor.constraint(equalTo: thumbContainer.trailingAnchor, constant: 10),
+            titleField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            titleField.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    func configure(with item: MTPObjectItem, thumbnail: NSImage?) {
+        titleField.stringValue = item.filename
         if item.isFolder {
-            Button {
-                viewModel.openItem(item)
-            } label: {
-                Label("Open", systemImage: "folder")
-            }
-            Divider()
-            Button {
-                viewModel.quickSaveToDownloads([item])
-            } label: {
-                Label("Save to Downloads", systemImage: "arrow.down.circle")
-            }
-            Button {
-                viewModel.promptAndExportFolders([item])
-            } label: {
-                Label("Export Folder…", systemImage: "folder.badge.plus")
+            thumbContainer.layer?.backgroundColor = NSColor.clear.cgColor
+            let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+            let img = NSImage(systemSymbolName: "folder.fill", accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
+            thumbImageView.image = img
+            thumbImageView.contentTintColor = .controlAccentColor
+        } else if let thumbnail {
+            thumbContainer.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.05).cgColor
+            thumbImageView.image = thumbnail
+            thumbImageView.contentTintColor = nil
+        } else {
+            thumbContainer.layer?.backgroundColor = NSColor.clear.cgColor
+            let sym = item.isVideo ? "video.fill" : "photo.fill"
+            let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+            thumbImageView.image = NSImage(systemSymbolName: sym, accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
+            thumbImageView.contentTintColor = .secondaryLabelColor
+        }
+    }
+
+    var contentHitMaxX: CGFloat {
+        let textWidth = ceil(titleField.attributedStringValue.size().width)
+        return min(bounds.maxX, 2 + 32 + 10 + textWidth + 8)
+    }
+}
+
+private final class MediaTextTableCellView: NSTableCellView {
+    private let labelField = NSTextField(labelWithString: "")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setupViews()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupViews()
+    }
+
+    private func setupViews() {
+        labelField.translatesAutoresizingMaskIntoConstraints = false
+        labelField.lineBreakMode = .byTruncatingTail
+        labelField.maximumNumberOfLines = 1
+        addSubview(labelField)
+        self.textField = labelField
+
+        NSLayoutConstraint.activate([
+            labelField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            labelField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            labelField.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    func configure(text: String, color: NSColor, monospaced: Bool) {
+        labelField.stringValue = text
+        labelField.textColor = color
+        if monospaced {
+            labelField.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        } else {
+            labelField.font = .systemFont(ofSize: NSFont.systemFontSize)
+        }
+    }
+}
+
+private final class MarqueeBandNSView: NSView {
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.controlAccentColor.withAlphaComponent(0.18).setFill()
+        bounds.fill()
+        NSColor.controlAccentColor.withAlphaComponent(0.85).setStroke()
+        let path = NSBezierPath(rect: bounds.insetBy(dx: 0.5, dy: 0.5))
+        path.lineWidth = 1.0
+        path.stroke()
+    }
+}
+
+private final class FinderStyleTableView: NSTableView {
+    weak var coordinator: MediaTableRepresentable.Coordinator?
+    private let marqueeView = MarqueeBandNSView(frame: .zero)
+    private var contextMenuActionTargets: [ContextMenuActionTarget] = []
+    private var anchorRow: Int? = nil
+    var isTrackingMouseInteraction: Bool = false
+
+    private var mouseDownPoint: NSPoint = .zero
+    private var clickedRowOnDown: Int = -1
+    private var shouldFileDragOnMove: Bool = false
+    private var hasStartedFileDrag: Bool = false
+    private var marqueeInitialSelection = IndexSet()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        marqueeView.isHidden = true
+        addSubview(marqueeView)
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        marqueeView.isHidden = true
+        addSubview(marqueeView)
+    }
+
+    private func isPointOnNameIconOrText(_ pt: NSPoint, row: Int) -> Bool {
+        guard row >= 0, column(at: pt) == 0 else { return false }
+        let cellFrame = frameOfCell(atColumn: 0, row: row)
+        if let nameCell = view(atColumn: 0, row: row, makeIfNecessary: false) as? MediaNameTableCellView {
+            let localX = pt.x - cellFrame.minX
+            return localX >= 0 && localX <= nameCell.contentHitMaxX
+        }
+        return pt.x <= cellFrame.minX + 180
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        guard let coordinator else {
+            super.mouseDown(with: event)
+            return
+        }
+
+        let startPoint = convert(event.locationInWindow, from: nil)
+        let clickedRow = row(at: startPoint)
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+        mouseDownPoint = startPoint
+        clickedRowOnDown = clickedRow
+        hasStartedFileDrag = false
+
+        if event.clickCount >= 2, clickedRow >= 0, let item = coordinator.item(at: clickedRow) {
+            isTrackingMouseInteraction = false
+            marqueeView.isHidden = true
+            coordinator.viewModel.openItem(item)
+            return
+        }
+
+        let wasRowSelected = clickedRow >= 0 && selectedRowIndexes.contains(clickedRow)
+        let hitIconOrName = isPointOnNameIconOrText(startPoint, row: clickedRow)
+
+        shouldFileDragOnMove = (clickedRow >= 0)
+            && !flags.contains(.command)
+            && !flags.contains(.shift)
+            && (wasRowSelected || hitIconOrName)
+
+        isTrackingMouseInteraction = true
+
+        if shouldFileDragOnMove {
+            if !wasRowSelected {
+                let single = IndexSet(integer: clickedRow)
+                coordinator.isProgrammaticSelectionUpdate = true
+                selectRowIndexes(single, byExtendingSelection: false)
+                coordinator.isProgrammaticSelectionUpdate = false
+                anchorRow = clickedRow
+                coordinator.pushTableSelectionToViewModel(single, anchorRow: clickedRow)
             }
         } else {
-            Button {
-                viewModel.openItem(item)
-            } label: {
-                Label(item.isVideo ? "Play Video" : "Quick Look", systemImage: item.isVideo ? "play" : "eye")
+            marqueeInitialSelection = selectedRowIndexes
+
+            if clickedRow >= 0 {
+                var clickSelection = marqueeInitialSelection
+                if flags.contains(.command) {
+                    if clickSelection.contains(clickedRow) {
+                        clickSelection.remove(clickedRow)
+                    } else {
+                        clickSelection.insert(clickedRow)
+                        anchorRow = clickedRow
+                    }
+                } else if flags.contains(.shift) {
+                    let startAnchor = anchorRow ?? marqueeInitialSelection.first ?? clickedRow
+                    let lower = min(startAnchor, clickedRow)
+                    let upper = max(startAnchor, clickedRow)
+                    clickSelection = IndexSet(integersIn: lower...upper)
+                } else {
+                    clickSelection = IndexSet(integer: clickedRow)
+                    anchorRow = clickedRow
+                }
+                coordinator.isProgrammaticSelectionUpdate = true
+                selectRowIndexes(clickSelection, byExtendingSelection: false)
+                coordinator.isProgrammaticSelectionUpdate = false
+                coordinator.pushTableSelectionToViewModel(clickSelection, anchorRow: anchorRow)
+            } else if !flags.contains(.command) && !flags.contains(.shift) {
+                coordinator.isProgrammaticSelectionUpdate = true
+                deselectAll(nil)
+                coordinator.isProgrammaticSelectionUpdate = false
+                anchorRow = nil
+                coordinator.pushTableSelectionToViewModel(IndexSet())
             }
-            Button {
-                viewModel.openInQuickLookOrDefaultApp(item)
-            } label: {
-                Label("Open in Default App", systemImage: "arrow.up.forward.app")
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard isTrackingMouseInteraction, let coordinator else { return }
+        let currentPoint = convert(event.locationInWindow, from: nil)
+        let distance = hypot(currentPoint.x - mouseDownPoint.x, currentPoint.y - mouseDownPoint.y)
+
+        if shouldFileDragOnMove {
+            guard !hasStartedFileDrag, distance >= 4.0, clickedRowOnDown >= 0 else { return }
+            hasStartedFileDrag = true
+            isTrackingMouseInteraction = false
+            startTableFileDragSession(with: event, primaryRow: clickedRowOnDown)
+        } else {
+            guard distance >= 3.0 else { return }
+            autoscroll(with: event)
+            let scrolledPoint = convert(event.locationInWindow, from: nil)
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+            let bandRect = NSRect(
+                x: min(mouseDownPoint.x, scrolledPoint.x),
+                y: min(mouseDownPoint.y, scrolledPoint.y),
+                width: max(1, abs(scrolledPoint.x - mouseDownPoint.x)),
+                height: max(1, abs(scrolledPoint.y - mouseDownPoint.y))
+            )
+
+            if marqueeView.superview !== self || subviews.last !== marqueeView {
+                marqueeView.removeFromSuperview()
+                addSubview(marqueeView)
             }
-            Divider()
-            if item.isImage {
-                Button {
-                    viewModel.copyImageToClipboard(item)
-                } label: {
-                    Label("Copy Image", systemImage: "doc.on.doc")
+            marqueeView.frame = bandRect
+            marqueeView.isHidden = false
+            marqueeView.needsDisplay = true
+
+            let candidateRange = rows(in: bandRect)
+            var hitRows = IndexSet()
+            if candidateRange.length > 0 {
+                let upperBound = min(numberOfRows, candidateRange.location + candidateRange.length)
+                for r in max(0, candidateRange.location) ..< upperBound {
+                    if rect(ofRow: r).intersects(bandRect) {
+                        hitRows.insert(r)
+                    }
                 }
             }
-            Button {
-                viewModel.quickSaveToDownloads([item])
-            } label: {
-                Label("Save to Downloads", systemImage: "arrow.down.circle")
+
+            let updatedRows: IndexSet
+            if flags.contains(.command) {
+                var sym = marqueeInitialSelection
+                for r in hitRows {
+                    if sym.contains(r) {
+                        sym.remove(r)
+                    } else {
+                        sym.insert(r)
+                    }
+                }
+                updatedRows = sym
+            } else if flags.contains(.shift) {
+                updatedRows = marqueeInitialSelection.union(hitRows)
+            } else {
+                updatedRows = hitRows
             }
-            Button {
-                viewModel.promptAndExportItems([item])
-            } label: {
-                Label("Export…", systemImage: "folder")
+
+            if selectedRowIndexes != updatedRows {
+                coordinator.isProgrammaticSelectionUpdate = true
+                selectRowIndexes(updatedRows, byExtendingSelection: false)
+                coordinator.isProgrammaticSelectionUpdate = false
+                coordinator.pushTableSelectionToViewModel(updatedRows, anchorRow: updatedRows.first)
             }
         }
-        Divider()
-        Button {
-            viewModel.selectedItemIDs = [item.handle]
-            viewModel.showInspector = true
-        } label: {
-            Label("Get Info", systemImage: "info.circle")
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if isTrackingMouseInteraction, shouldFileDragOnMove, !hasStartedFileDrag, clickedRowOnDown >= 0, let coordinator {
+            let single = IndexSet(integer: clickedRowOnDown)
+            coordinator.isProgrammaticSelectionUpdate = true
+            selectRowIndexes(single, byExtendingSelection: false)
+            coordinator.isProgrammaticSelectionUpdate = false
+            anchorRow = clickedRowOnDown
+            coordinator.pushTableSelectionToViewModel(single, anchorRow: clickedRowOnDown)
         }
+        isTrackingMouseInteraction = false
+        hasStartedFileDrag = false
+        marqueeView.isHidden = true
+    }
+
+    private func startTableFileDragSession(with event: NSEvent, primaryRow: Int) {
+        guard let coordinator, let primaryItem = coordinator.item(at: primaryRow) else { return }
+        let vm = coordinator.viewModel
+        let itemsToDrag = vm.itemsForDrag(startingWith: primaryItem)
+        guard !itemsToDrag.isEmpty else { return }
+
+        vm.dragCoordinator.prepareForDragBatch(items: itemsToDrag)
+
+        let clickPt = convert(event.locationInWindow, from: nil)
+        var draggingItems: [NSDraggingItem] = []
+        draggingItems.reserveCapacity(itemsToDrag.count)
+
+        for (idx, item) in itemsToDrag.enumerated() {
+            let thumb = vm.thumbnails[item.handle]
+            let provider = vm.dragCoordinator.makeFilePromiseProvider(for: item, cachedImage: thumb)
+            let dragItem = NSDraggingItem(pasteboardWriter: provider)
+
+            let previewSize = NSSize(width: 120, height: 68)
+            let origin = CGPoint(
+                x: clickPt.x - previewSize.width * 0.5 + CGFloat(min(idx, 4) * 4),
+                y: clickPt.y - previewSize.height * 0.5 + CGFloat(min(idx, 4) * 4)
+            )
+            let dragImage = DragPreviewRenderer.makeDragImage(
+                for: item,
+                thumbnail: thumb,
+                size: previewSize
+            )
+            dragItem.setDraggingFrame(NSRect(origin: origin, size: previewSize), contents: dragImage)
+            draggingItems.append(dragItem)
+        }
+
+        let session = beginDraggingSession(with: draggingItems, event: event, source: self)
+        session.animatesToStartingPositionsOnCancelOrFail = true
+        session.draggingFormation = .default
+    }
+
+    override func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        super.draggingSession(session, endedAt: screenPoint, operation: operation)
+        isTrackingMouseInteraction = false
+        hasStartedFileDrag = false
+        marqueeView.isHidden = true
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard let coordinator else { return nil }
+        let pt = convert(event.locationInWindow, from: nil)
+        let clickedRow = row(at: pt)
+        guard clickedRow >= 0, let clickedItem = coordinator.item(at: clickedRow) else { return nil }
+
+        let vm = coordinator.viewModel
+        if !selectedRowIndexes.contains(clickedRow) {
+            let single = IndexSet(integer: clickedRow)
+            coordinator.isProgrammaticSelectionUpdate = true
+            selectRowIndexes(single, byExtendingSelection: false)
+            coordinator.isProgrammaticSelectionUpdate = false
+            anchorRow = clickedRow
+            coordinator.pushTableSelectionToViewModel(single, anchorRow: clickedRow)
+        }
+
+        let targetItems = vm.selectedItems.isEmpty ? [clickedItem] : vm.selectedItems
+        let built = BrowserContextMenuBuilder.makeMenu(for: targetItems, viewModel: vm)
+        contextMenuActionTargets = built.targets
+        return built.menu
+    }
+
+    override func selectAll(_ sender: Any?) {
+        super.selectAll(sender)
+        coordinator?.pushTableSelectionToViewModel(selectedRowIndexes)
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        coordinator?.viewModel.clearSelection()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 49 || event.keyCode == 36 { // Space or Return
+            if let first = coordinator?.viewModel.selectedItems.first {
+                coordinator?.viewModel.openItem(first)
+                return
+            }
+        }
+        super.keyDown(with: event)
+    }
+}
+
+// MARK: - Drag Preview & Native Context Menu Builders
+
+private enum DragPreviewRenderer {
+    static func makeDragImage(for item: MTPObjectItem, thumbnail: NSImage?, size: NSSize) -> NSImage {
+        let img = NSImage(size: size)
+        img.lockFocus()
+        defer { img.unlockFocus() }
+
+        let rect = NSRect(origin: .zero, size: size)
+        let clipPath = NSBezierPath(roundedRect: rect.insetBy(dx: 1, dy: 1), xRadius: 7, yRadius: 7)
+        NSGraphicsContext.current?.saveGraphicsState()
+        clipPath.addClip()
+
+        if let thumbnail, !item.isFolder {
+            thumbnail.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 0.95)
+        } else {
+            NSColor.windowBackgroundColor.withAlphaComponent(0.95).setFill()
+            rect.fill()
+            let symbolName = item.isFolder ? "folder.fill" : (item.isVideo ? "video.fill" : "photo.fill")
+            let cfg = NSImage.SymbolConfiguration(pointSize: min(size.height * 0.45, 30), weight: .regular)
+            if let sym = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?.withSymbolConfiguration(cfg) {
+                let symSize = sym.size
+                let symRect = NSRect(
+                    x: (size.width - symSize.width) * 0.5,
+                    y: (size.height - symSize.height) * 0.5,
+                    width: symSize.width,
+                    height: symSize.height
+                )
+                sym.draw(in: symRect, from: .zero, operation: .sourceOver, fraction: 0.9)
+            }
+        }
+
+        NSGraphicsContext.current?.restoreGraphicsState()
+        NSColor.white.withAlphaComponent(0.35).setStroke()
+        clipPath.lineWidth = 1.5
+        clipPath.stroke()
+        return img
+    }
+}
+
+private final class ContextMenuActionTarget: NSObject {
+    let handler: () -> Void
+
+    init(_ handler: @escaping () -> Void) {
+        self.handler = handler
+    }
+
+    @objc func invoke() {
+        handler()
+    }
+}
+
+private enum BrowserContextMenuBuilder {
+    static func makeMenu(
+        for items: [MTPObjectItem],
+        viewModel: MTPViewModel
+    ) -> (menu: NSMenu, targets: [ContextMenuActionTarget]) {
+        let menu = NSMenu()
+        var targets: [ContextMenuActionTarget] = []
+
+        func addItem(title: String, systemImage: String, action: @escaping () -> Void) {
+            let target = ContextMenuActionTarget(action)
+            targets.append(target)
+            let menuItem = NSMenuItem(title: title, action: #selector(ContextMenuActionTarget.invoke), keyEquivalent: "")
+            menuItem.target = target
+            menuItem.image = NSImage(systemSymbolName: systemImage, accessibilityDescription: nil)
+            menu.addItem(menuItem)
+        }
+
+        if items.count == 1, let item = items.first {
+            if item.isFolder {
+                addItem(title: "Open", systemImage: "folder") {
+                    viewModel.openItem(item)
+                }
+                menu.addItem(.separator())
+                addItem(title: "Save to Downloads", systemImage: "arrow.down.circle") {
+                    viewModel.quickSaveToDownloads([item])
+                }
+                addItem(title: "Export Folder…", systemImage: "folder.badge.plus") {
+                    viewModel.promptAndExportFolders([item])
+                }
+            } else {
+                addItem(
+                    title: item.isVideo ? "Play Video" : "Quick Look",
+                    systemImage: item.isVideo ? "play" : "eye"
+                ) {
+                    viewModel.openItem(item)
+                }
+                addItem(title: "Open in Default App", systemImage: "arrow.up.forward.app") {
+                    viewModel.openInQuickLookOrDefaultApp(item)
+                }
+                menu.addItem(.separator())
+                if item.isImage {
+                    addItem(title: "Copy Image", systemImage: "doc.on.doc") {
+                        viewModel.copyImageToClipboard(item)
+                    }
+                }
+                addItem(title: "Save to Downloads", systemImage: "arrow.down.circle") {
+                    viewModel.quickSaveToDownloads([item])
+                }
+                addItem(title: "Export…", systemImage: "folder") {
+                    viewModel.promptAndExportItems([item])
+                }
+            }
+            menu.addItem(.separator())
+            addItem(title: "Get Info", systemImage: "info.circle") {
+                viewModel.selectedItemIDs = [item.handle]
+                viewModel.showInspector = true
+            }
+        } else if !items.isEmpty {
+            addItem(
+                title: "Save \(items.count) Items to Downloads",
+                systemImage: "arrow.down.circle"
+            ) {
+                viewModel.quickSaveToDownloads(items)
+            }
+            addItem(
+                title: "Export \(items.count) Items…",
+                systemImage: "folder"
+            ) {
+                viewModel.promptAndExportItems(items)
+            }
+        }
+
+        return (menu, targets)
     }
 }
 
