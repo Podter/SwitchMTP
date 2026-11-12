@@ -9,8 +9,6 @@ Because macOS does not mount MTP devices in Finder natively, SwitchMTP communica
 >
 > This project was **vibecoded by AI**. It is provided **"AS IS"**, without warranty of any kind, express or implied. While it only uses standard read-only MTP commands (`GetDeviceInfo`, `GetStorageIDs`, `GetStorageInfo`, `GetObjectHandles`, `GetObjectInfo`, `GetObject`, `GetThumb`), it directly interacts with low-level macOS USB interfaces (`IOUSBHost`) and terminates competing background processes (`ptpcamerad`) to claim the USB interface. **Use at your own risk.**
 
----
-
 ## Features
 
 - **Zero External Dependencies**: Built entirely with native macOS frameworks (`SwiftUI`, `AppKit`, `AVKit`, `IOKit`, and `IOUSBHost`).
@@ -30,8 +28,6 @@ Because macOS does not mount MTP devices in Finder natively, SwitchMTP communica
   - **Export Selected / Export All** (`⇧⌘E` / `⌥⌘E`) to any folder, with optional **Organize by Game Folder** support.
   - **Copy Image to Clipboard** (`⇧⌘C`) for quick sharing.
 
----
-
 ## How to Use
 
 1. Launch **SwitchMTP** on your Mac.
@@ -39,8 +35,6 @@ Because macOS does not mount MTP devices in Finder natively, SwitchMTP communica
 3. On your Nintendo Switch, go to:
    **System Settings → Data Management → Manage Screenshots and Videos → Copy to a Computer via USB Connection**
 4. SwitchMTP will automatically detect your Switch, open an MTP session, and load your Album.
-
----
 
 ## Building from Source
 
@@ -64,13 +58,9 @@ Because macOS does not mount MTP devices in Finder natively, SwitchMTP communica
 xcodebuild -project SwitchMTP.xcodeproj -scheme SwitchMTP -configuration Debug -destination "platform=macOS" build
 ```
 
----
-
-## How It Works Deeply
+## How It Works
 
 If you want to understand how SwitchMTP works under the hood—including its architecture, Swift 6 concurrency model, USB Bulk pipe communication, and Nintendo Switch MTP protocol quirks (such as split 12-byte Data container headers, 512-byte Bulk IN buffer alignment, `0x201E` stale session recovery, and `ptpcamerad` USB interface claiming)—check out **[AGENTS.md](./AGENTS.md)**, which serves as a comprehensive technical deep-dive and protocol reference.
-
----
 
 ## License
 
