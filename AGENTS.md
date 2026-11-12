@@ -7,17 +7,17 @@
 ### Key Technologies & Frameworks
 
 - **Language**: Swift (Swift 6 approachable concurrency / default `@MainActor` isolation enabled)
-- **UI**: SwiftUI + AppKit (`NavigationSplitView`, `HSplitView`, `NSOpenPanel`, `NSPasteboard`, `NSWorkspace`)
-- **Video Playback**: `AVKit` (`AVPlayerView` wrapped via `NSViewRepresentable` in `MacVideoPlayerView`)
+- **UI**: SwiftUI + AppKit (`NavigationSplitView`, `.inspector`, `Table`, `NSOpenPanel`, `NSPasteboard`, `NSWorkspace`)
+- **Video Playback**: `AVFoundation` + `AVKit` (`AVPlayerView` wrapped via `NSViewRepresentable` in `MacVideoPlayerView`)
 - **USB & MTP Transport**: `IOKit` and `IOUSBHost` (`IOUSBHostInterface`, `IOUSBHostPipe`)
 
 ### Architecture & File Organization
 
-- `SwitchMTP/SwitchMTPApp.swift`: Application entry point and main window configuration (`1200×780` default size).
+- `SwitchMTP/SwitchMTPApp.swift`: Application entry point (`Window("SwitchMTP", id: "main")` with `1120×740` default size, `860×540` min size, and `.unified` toolbar style) and `AppDelegate` enforcing single-instance launch, terminating when the last window closes, and disabling macOS window tabbing (`NSWindow.allowsAutomaticWindowTabbing = false` and removing tab menu items).
 - `SwitchMTP/MTPModels.swift`: `nonisolated`, `Sendable` protocol constants and data models (`MTPContainerType`, `MTPOperationCode`, `MTPResponseCode`, `MTPObjectFormat`, `MTPDeviceDetails`, `MTPStorage`, `MTPObjectItem`, `MTPError`, and `MTPDateParser`).
 - `SwitchMTP/MTPUSBClient.swift`: Low-level USB device discovery and MTP session/container engine. Runs all synchronous `IOUSBHostPipe` bulk transfers on a dedicated serial `DispatchQueue` (`me.podter.SwitchMTP.usbQueue`) bridged to Swift `async`/`await`.
-- `SwitchMTP/MTPViewModel.swift`: `@Observable` main-actor view model managing USB hotplug polling, directory navigation, background `All Media` indexing, in-memory thumbnail caching (`GetThumb`), full-resolution image/video previewing, clipboard copy, and single/batch file export.
-- `SwitchMTP/ContentView.swift`: Split-view explorer UI with Sidebar (device status card, Library filters, Album storage, and Game Folders), Breadcrumb & Filter bar, 16:9 Thumbnail Grid view, multi-column Table view, right-hand Inspector pane, and full-window Media Lightbox sheet.
+- `SwitchMTP/MTPViewModel.swift`: `@Observable` main-actor view model managing USB hotplug polling (every 2 seconds), directory & breadcrumb navigation, progressive `All Media` indexing, in-memory folder and thumbnail caching (`GetThumb`), full-resolution image/video previewing, clipboard copy, Quick Save to `~/Downloads`, and single/batch file or folder export.
+- `SwitchMTP/ContentView.swift`: Native macOS split-view explorer UI (`NavigationSplitView` + `.inspector`) featuring a Sidebar (`Library` filters: `All Media`, `Screenshots`, `Videos`, `All Games`; `Games` folder list; and bottom `DeviceStatusFooter` with device info popover), unified toolbar (back navigation, title/subtitle, search, Grid/List segmented picker, Filter/Sort/Thumbnail Size menu, Save/Export menu, and Info inspector toggle), 16:9 Thumbnail Grid view (`MediaGridView`), multi-column Table view (`MediaTableView`), right-hand Inspector pane (`InspectorPane`), and full-size Media Lightbox sheet (`MediaLightboxSheet`).
 
 ---
 
@@ -77,8 +77,10 @@ Agents modifying `MTPUSBClient.swift` or `MTPModels.swift` must preserve these h
 
 ---
 
-## Code Style & Concurrency Guidelines
+## Code Style, UI & Concurrency Guidelines
 
+- **Apple Human Interface Guidelines (HIG)**:
+  - When designing or modifying any UI, always follow the [Apple Human Interface Guidelines for macOS](https://developer.apple.com/design/human-interface-guidelines). Use native macOS patterns, standard SwiftUI/AppKit controls, semantic colors and materials, standard SF Symbols, keyboard shortcuts, and expected window/split-view behaviors.
 - **Default Actor Isolation**: This target uses Swift 6 approachable concurrency where types are `@MainActor`-isolated by default unless annotated.
   - Mark pure data models and parsers in `MTPModels.swift` and `MTPUSBClient.swift` as `nonisolated` so they can be used on the background USB queue without actor-hopping warnings.
 - **USB Thread Safety**:
@@ -89,8 +91,10 @@ Agents modifying `MTPUSBClient.swift` or `MTPModels.swift` must preserve these h
 
 ---
 
-## Debugging & Troubleshooting
+## Hardware Testing & Debugging
 
+- **Live Hardware Testing with User**:
+  - It is completely okay (and encouraged) to ask the user to connect their physical Nintendo Switch via USB and enable **System Settings → Data Management → Manage Screenshots and Videos → Copy to a Computer via USB Connection** whenever you need to verify device connection, test MTP operations, or confirm end-to-end functionality.
 - **"Nintendo Switch disconnected" / Device Not Found**:
   - Verify the Switch is awake and on the **System Settings → Data Management → Manage Screenshots and Videos → Copy to a Computer via USB Connection** screen.
   - Check `MTPUSBClient.isSwitchPresentInRegistry()` to confirm macOS enumerates `idVendor == 0x057E` and `idProduct == 0x201D`.
