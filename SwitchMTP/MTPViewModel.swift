@@ -801,7 +801,11 @@ final class MTPViewModel {
             return
         }
         Task {
-            try? await exportItems(items, toDirectory: downloadsURL, revealWhenDone: true)
+            try? await exportItems(
+                items,
+                toDirectory: downloadsURL,
+                revealWhenDone: AppSettings.revealInFinderAfterExport
+            )
         }
     }
     
@@ -817,7 +821,11 @@ final class MTPViewModel {
         
         if panel.runModal() == .OK, let destinationDir = panel.url {
             Task {
-                try? await exportItems(items, toDirectory: destinationDir, revealWhenDone: true)
+                try? await exportItems(
+                    items,
+                    toDirectory: destinationDir,
+                    revealWhenDone: AppSettings.revealInFinderAfterExport
+                )
             }
         }
     }
@@ -857,7 +865,11 @@ final class MTPViewModel {
                         filesToExport.append(contentsOf: fetched.filter { !$0.isFolder })
                     }
                 }
-                try? await exportItems(filesToExport, toDirectory: destinationDir, revealWhenDone: true)
+                try? await exportItems(
+                    filesToExport,
+                    toDirectory: destinationDir,
+                    revealWhenDone: AppSettings.revealInFinderAfterExport
+                )
             }
         }
     }
@@ -896,7 +908,7 @@ final class MTPViewModel {
             transferStatus = nil
         }
         
-        var lastExportedURL: URL? = nil
+        var exportedURLs: [URL] = []
         let startTime = CFAbsoluteTimeGetCurrent()
         var cumulativeBytes: Int64 = 0
         
@@ -932,13 +944,13 @@ final class MTPViewModel {
                 }
             }
             cumulativeBytes += Int64(fileItem.compressedSize)
-            lastExportedURL = fileURL
+            exportedURLs.append(fileURL)
         }
         
         showTemporaryBanner("Exported \(flatFiles.count) file\(flatFiles.count == 1 ? "" : "s") to \"\(baseDirectory.lastPathComponent)\"")
         
-        if revealWhenDone, let lastExportedURL {
-            NSWorkspace.shared.activateFileViewerSelecting([lastExportedURL])
+        if revealWhenDone, !exportedURLs.isEmpty {
+            NSWorkspace.shared.activateFileViewerSelecting(exportedURLs)
         }
     }
     

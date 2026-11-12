@@ -76,7 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func configureWindowsAndMenus() {
         for window in NSApp.windows {
             window.tabbingMode = .disallowed
-            if window.identifier?.rawValue == "main" || window.contentMinSize.width < 860 {
+            if window.identifier?.rawValue == "main" {
                 window.contentMinSize = NSSize(width: 860, height: 540)
             }
         }
@@ -96,6 +96,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+nonisolated enum AppSettings {
+    static let revealInFinderAfterExportKey = "SwitchMTP.revealInFinderAfterExport"
+
+    static var revealInFinderAfterExport: Bool {
+        UserDefaults.standard.bool(forKey: revealInFinderAfterExportKey)
+    }
+}
+
+struct SettingsView: View {
+    @AppStorage(AppSettings.revealInFinderAfterExportKey)
+    private var revealInFinderAfterExport = false
+
+    var body: some View {
+        Form {
+            Section("Exports") {
+                Toggle(isOn: $revealInFinderAfterExport) {
+                    Text("Reveal exported items in Finder")
+                    Text("Automatically show saved or exported files in Finder when a transfer finishes.")
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 440)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
 @main
 struct SwitchMTPApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -103,6 +130,7 @@ struct SwitchMTPApp: App {
     var body: some Scene {
         Window("SwitchMTP", id: "main") {
             ContentView()
+                .frame(minWidth: 860, minHeight: 540)
         }
         .defaultSize(width: 1120, height: 740)
         .windowToolbarStyle(.unified)
@@ -111,5 +139,10 @@ struct SwitchMTPApp: App {
             SidebarCommands()
             InspectorCommands()
         }
+
+        Settings {
+            SettingsView()
+        }
+        .windowResizability(.contentSize)
     }
 }
