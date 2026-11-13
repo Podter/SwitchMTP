@@ -2,12 +2,18 @@
 
 **SwitchMTP** is a native macOS MTP (Media Transfer Protocol) explorer built specifically for the Nintendo Switch's **"Copy to a Computer via USB Connection"** mode.
 
-Because macOS does not mount MTP devices in Finder natively, SwitchMTP communicates directly with the Nintendo Switch over USB Bulk pipes using Apple's native `IOKit` and `IOUSBHost` frameworks—with **zero external dependencies** (no `libmtp`, Homebrew, or kernel extensions required).
+![SwitchMTP Screenshot](./docs/switchmtp-screenshot.png)
 
 > [!WARNING]
 > **Disclaimer — Vibecoded by AI (Use at Your Own Risk)**
 >
-> This project was **vibecoded by AI**. It is provided **"AS IS"**, without warranty of any kind, express or implied. While it only uses standard read-only MTP commands (`GetDeviceInfo`, `GetStorageIDs`, `GetStorageInfo`, `GetObjectHandles`, `GetObjectInfo`, `GetObject`, `GetThumb`), it directly interacts with low-level macOS USB interfaces (`IOUSBHost`) and terminates competing background processes (`ptpcamerad`) to claim the USB interface. **Use at your own risk.**
+> This project was **vibecoded by AI** (including this read me file). It is provided **"AS IS"**, without warranty of any kind, express or implied. While it only uses standard read-only MTP commands (`GetDeviceInfo`, `GetStorageIDs`, `GetStorageInfo`, `GetObjectHandles`, `GetObjectInfo`, `GetObject`, `GetThumb`), it directly interacts with low-level macOS USB interfaces (`IOUSBHost`) and terminates competing background processes (`ptpcamerad`) to claim the USB interface. **Use at your own risk.**
+
+## Why
+
+I wanted to use the Nintendo Switch's **"Copy to a Computer via USB Connection"** feature on macOS, but MTP isn't supported natively on macOS. After doing some research, I found that Google's official Android File Transfer app is dead, and trying several open-source alternatives like OpenMTP and SwiftMTP didn't work either—the Switch would immediately disconnect as soon as I tried to access the screenshots.
+
+Because macOS does not mount MTP devices in Finder natively—and general-purpose MTP tools struggle with the Switch's USB/MTP quirks—I decided to build (vibecode) my own. SwitchMTP communicates directly with the Nintendo Switch over USB Bulk pipes using Apple's native `IOKit` and `IOUSBHost` frameworks—with **zero external dependencies** (no `libmtp`, Homebrew, or kernel extensions required).
 
 ## Features
 
