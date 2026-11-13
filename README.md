@@ -2,7 +2,7 @@
 
 **SwitchMTP** is a native macOS MTP (Media Transfer Protocol) explorer built specifically for the Nintendo Switch's **"Copy to a Computer via USB Connection"** mode.
 
-![SwitchMTP Screenshot](./docs/switchmtp-screenshot.png)
+![SwitchMTP Screenshot](./docs/screenshot.png)
 
 > [!WARNING]
 > **Disclaimer — Vibecoded by AI (Use at Your Own Risk)**
