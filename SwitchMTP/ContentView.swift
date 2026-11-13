@@ -2592,6 +2592,9 @@ private struct MediaLightboxSheet: View {
                         if let player = viewModel.previewPlayer {
                             MacVideoPlayerView(player: player)
                                 .onAppear { player.play() }
+                                .onChange(of: ObjectIdentifier(player)) { _, _ in
+                                    player.play()
+                                }
                         } else {
                             if let thumb = viewModel.thumbnails[item.handle] {
                                 Image(nsImage: thumb)

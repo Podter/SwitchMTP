@@ -365,9 +365,18 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
         }
     }
     
+    func disconnectBlocking() {
+        try? runOnUSBQueueSync {
+            self.disconnectSync()
+        }
+    }
+    
     private func disconnectSync() {
         if isSessionOpen {
-            _ = try? executeCommandSync(.closeSession, timeout: 1.0)
+            if let resp = try? executeCommandSync(.closeSession, timeout: 1.0),
+               resp.responseCode == MTPResponseCode.ok.rawValue {
+                UserDefaults.standard.removeObject(forKey: "SwitchMTP.lastTransactionID")
+            }
             isSessionOpen = false
         }
         pipeIn = nil
@@ -442,35 +451,46 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
             // Probe for the active TransactionID to send CloseSession (try last known tx first, then scan)
             let savedTx = UInt32(UserDefaults.standard.integer(forKey: "SwitchMTP.lastTransactionID"))
             var candidates: [UInt32] = []
+            var seen = Set<UInt32>()
+            func appendCandidate(_ tx: UInt32) {
+                if seen.insert(tx).inserted {
+                    candidates.append(tx)
+                }
+            }
             if lastDrainedTransactionID > 0 {
-                candidates.append(lastDrainedTransactionID &+ 1)
-                candidates.append(lastDrainedTransactionID)
+                appendCandidate(lastDrainedTransactionID &+ 1)
+                appendCandidate(lastDrainedTransactionID)
             }
             if savedTx > 0 {
-                candidates.append(savedTx)
-                candidates.append(savedTx &+ 1)
+                appendCandidate(savedTx)
+                appendCandidate(savedTx &+ 1)
+                if savedTx > 1 { appendCandidate(savedTx - 1) }
             }
-            candidates.append(contentsOf: 0...5000)
+            for tx in UInt32(0)...UInt32(5000) {
+                appendCandidate(tx)
+            }
             
             var closed = false
             for candidateTx in candidates {
                 if let closeResp = try? executeCommandSync(.closeSession, useExplicitTransactionID: candidateTx, timeout: 1.0),
-                   closeResp.responseCode == MTPResponseCode.ok.rawValue {
+                   closeResp.responseCode == MTPResponseCode.ok.rawValue || closeResp.responseCode == MTPResponseCode.sessionNotOpen.rawValue {
                     print("[SwitchMTP] Recovered open session at tx=\(candidateTx) and closed cleanly")
                     closed = true
                     break
                 }
             }
-            if closed {
-                let reopen = try executeCommandSync(.openSession, parameters: [1], useExplicitTransactionID: 0, timeout: 3.0)
-                guard reopen.responseCode == MTPResponseCode.ok.rawValue else {
-                    throw MTPError.unexpectedResponse(MTPResponseCode(rawValue: reopen.responseCode), reopen.responseCode)
-                }
+            guard closed else {
+                throw MTPError.unexpectedResponse(.sessionAlreadyOpen, resp.responseCode)
+            }
+            let reopen = try executeCommandSync(.openSession, parameters: [1], useExplicitTransactionID: 0, timeout: 3.0)
+            guard reopen.responseCode == MTPResponseCode.ok.rawValue else {
+                throw MTPError.unexpectedResponse(MTPResponseCode(rawValue: reopen.responseCode), reopen.responseCode)
             }
         } else if resp.responseCode != MTPResponseCode.ok.rawValue {
             throw MTPError.unexpectedResponse(MTPResponseCode(rawValue: resp.responseCode), resp.responseCode)
         }
         transactionID = 1
+        UserDefaults.standard.set(1, forKey: "SwitchMTP.lastTransactionID")
         isSessionOpen = true
     }
     
@@ -503,19 +523,12 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
         includeChildCountsForFolders: Bool = true
     ) async throws -> [MTPObjectItem] {
         try await runOnUSBQueue {
-            let handles = try self.fetchObjectHandlesSync(storageID: storageID, parentHandle: parentHandle)
-            var items: [MTPObjectItem] = []
-            items.reserveCapacity(handles.count)
-            for handle in handles {
-                var item = try self.fetchObjectInfoSync(handle: handle, folderName: folderName)
-                if item.isFolder && includeChildCountsForFolders {
-                    if let childHandles = try? self.fetchObjectHandlesSync(storageID: storageID, parentHandle: handle) {
-                        item.childCount = childHandles.count
-                    }
-                }
-                items.append(item)
-            }
-            return items
+            try self.fetchDirectoryItemsOnQueue(
+                storageID: storageID,
+                parentHandle: parentHandle,
+                folderName: folderName,
+                includeChildCountsForFolders: includeChildCountsForFolders
+            )
         }
     }
     
@@ -556,33 +569,32 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
         includeChildCountsForFolders: Bool = false
     ) throws -> [MTPObjectItem] {
         try runOnUSBQueueSync {
-            let handles = try self.fetchObjectHandlesSync(storageID: storageID, parentHandle: parentHandle)
-            var items: [MTPObjectItem] = []
-            items.reserveCapacity(handles.count)
-            for handle in handles {
-                var item = try self.fetchObjectInfoSync(handle: handle, folderName: folderName)
-                if item.isFolder && includeChildCountsForFolders {
-                    if let childHandles = try? self.fetchObjectHandlesSync(storageID: storageID, parentHandle: handle) {
-                        item.childCount = childHandles.count
-                    }
-                }
-                items.append(item)
-            }
-            return items
+            try self.fetchDirectoryItemsOnQueue(
+                storageID: storageID,
+                parentHandle: parentHandle,
+                folderName: folderName,
+                includeChildCountsForFolders: includeChildCountsForFolders
+            )
         }
     }
     
-    func fetchObjectDataBlocking(
-        handle: UInt32,
-        progress: (@Sendable (Int64, Int64) -> Void)? = nil
-    ) throws -> Data {
-        try runOnUSBQueueSync {
-            let resp = try self.executeCommandSync(.getObject, parameters: [handle], timeout: 30.0, progress: progress)
-            guard resp.responseCode == MTPResponseCode.ok.rawValue else {
-                throw MTPError.unexpectedResponse(MTPResponseCode(rawValue: resp.responseCode), resp.responseCode)
+    private func fetchDirectoryItemsOnQueue(
+        storageID: UInt32,
+        parentHandle: UInt32,
+        folderName: String,
+        includeChildCountsForFolders: Bool
+    ) throws -> [MTPObjectItem] {
+        let handles = try self.fetchObjectHandlesSync(storageID: storageID, parentHandle: parentHandle)
+        var items: [MTPObjectItem] = []
+        items.reserveCapacity(handles.count)
+        for handle in handles {
+            var item = try self.fetchObjectInfoSync(handle: handle, folderName: folderName)
+            if item.isFolder && includeChildCountsForFolders {
+                item.childCount = self.fetchObjectCountSync(storageID: storageID, parentHandle: handle)
             }
-            return resp.data
+            items.append(item)
         }
+        return items
     }
     
     func downloadObjectToFileBlocking(
@@ -617,6 +629,7 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
         let respCode = try self.streamCommandToFileSync(
             .getObject,
             parameters: [item.handle],
+            expectedObjectSize: item.compressedSize,
             fileHandle: fileHandle,
             timeout: 30.0,
             progress: progress
@@ -635,6 +648,15 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
     }
     
     // MARK: - Internal Synchronous Helpers (run on usbQueue)
+    
+    private func fetchObjectCountSync(storageID: UInt32, formatCode: UInt32 = 0, parentHandle: UInt32) -> Int? {
+        if let resp = try? executeCommandSync(.getNumObjects, parameters: [storageID, formatCode, parentHandle]),
+           resp.responseCode == MTPResponseCode.ok.rawValue,
+           let count = resp.responseParams.first {
+            return Int(count)
+        }
+        return try? fetchObjectHandlesSync(storageID: storageID, formatCode: formatCode, parentHandle: parentHandle).count
+    }
     
     private func fetchObjectHandlesSync(storageID: UInt32, formatCode: UInt32 = 0, parentHandle: UInt32 = 0xFFFFFFFF) throws -> [UInt32] {
         let resp = try executeCommandSync(.getObjectHandles, parameters: [storageID, formatCode, parentHandle])
@@ -715,6 +737,7 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
         if containerType == MTPContainerType.data.rawValue {
             let expectedPayload = max(0, Int(containerLen) - 12)
             payload.reserveCapacity(expectedPayload)
+            var lastProgressTime = CFAbsoluteTimeGetCurrent()
             
             if firstPkt.count > 12 {
                 payload.append(firstPkt.subdata(in: 12..<firstPkt.count))
@@ -727,7 +750,11 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
                 let chunk = try readBulkPacket(maxLength: chunkReq)
                 if chunk.isEmpty { break }
                 payload.append(chunk)
-                progress?(Int64(payload.count), Int64(expectedPayload))
+                let now = CFAbsoluteTimeGetCurrent()
+                if payload.count >= expectedPayload || (now - lastProgressTime) >= 0.05 {
+                    lastProgressTime = now
+                    progress?(Int64(min(payload.count, expectedPayload)), Int64(expectedPayload))
+                }
             }
             
             if payload.count > expectedPayload {
@@ -764,6 +791,7 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
     private func streamCommandToFileSync(
         _ op: MTPOperationCode,
         parameters: [UInt32],
+        expectedObjectSize: UInt64 = 0,
         fileHandle: FileHandle,
         timeout: TimeInterval,
         progress: (@Sendable (Int64, Int64) -> Void)?
@@ -810,29 +838,56 @@ nonisolated final class MTPUSBClient: @unchecked Sendable {
         
         var responsePkt = firstPkt
         if containerType == MTPContainerType.data.rawValue {
-            let expectedPayload = max(0, Int64(containerLen) - 12)
+            let expectedPayload: Int64
+            if containerLen == 0xFFFFFFFF && expectedObjectSize > 0 {
+                expectedPayload = Int64(expectedObjectSize)
+            } else {
+                expectedPayload = max(0, Int64(containerLen) - 12)
+            }
             var writtenBytes: Int64 = 0
+            var trailingBytes = Data()
+            var lastProgressTime = CFAbsoluteTimeGetCurrent()
             
             if firstPkt.count > 12 {
                 let initialData = firstPkt.subdata(in: 12..<firstPkt.count)
-                try fileHandle.write(contentsOf: initialData)
-                writtenBytes += Int64(initialData.count)
+                let allowedCount = Int(min(Int64(initialData.count), max(0, expectedPayload - writtenBytes)))
+                if allowedCount > 0 {
+                    try fileHandle.write(contentsOf: initialData.prefix(allowedCount))
+                    writtenBytes += Int64(allowedCount)
+                }
+                if initialData.count > allowedCount {
+                    trailingBytes.append(initialData.subdata(in: allowedCount..<initialData.count))
+                }
                 progress?(writtenBytes, expectedPayload)
             }
             
             while writtenBytes < expectedPayload {
-                let remaining = Int(expectedPayload - writtenBytes)
-                let chunkReq = min(1_048_576, remaining)
+                let remaining = expectedPayload - writtenBytes
+                let chunkReq = Int(min(Int64(1_048_576), remaining))
                 let chunk = try readBulkPacket(maxLength: chunkReq)
                 if chunk.isEmpty { break }
-                try fileHandle.write(contentsOf: chunk)
-                writtenBytes += Int64(chunk.count)
-                progress?(writtenBytes, expectedPayload)
+                let allowedCount = Int(min(Int64(chunk.count), max(0, expectedPayload - writtenBytes)))
+                if allowedCount > 0 {
+                    try fileHandle.write(contentsOf: chunk.prefix(allowedCount))
+                    writtenBytes += Int64(allowedCount)
+                }
+                if chunk.count > allowedCount {
+                    trailingBytes.append(chunk.subdata(in: allowedCount..<chunk.count))
+                }
+                let now = CFAbsoluteTimeGetCurrent()
+                if writtenBytes >= expectedPayload || (now - lastProgressTime) >= 0.05 {
+                    lastProgressTime = now
+                    progress?(writtenBytes, expectedPayload)
+                }
             }
             
-            responsePkt = try readBulkPacket(maxLength: 512)
-            while responsePkt.isEmpty {
+            if trailingBytes.count >= 12 {
+                responsePkt = trailingBytes
+            } else {
                 responsePkt = try readBulkPacket(maxLength: 512)
+                while responsePkt.isEmpty {
+                    responsePkt = try readBulkPacket(maxLength: 512)
+                }
             }
         }
         

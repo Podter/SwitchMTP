@@ -24,7 +24,6 @@ nonisolated enum MTPOperationCode: UInt16, Sendable {
     case getObjectInfo = 0x1008
     case getObject = 0x1009
     case getThumb = 0x100A
-    case getPartialObject = 0x101B
 }
 
 nonisolated enum MTPResponseCode: UInt16, Sendable {

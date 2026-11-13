@@ -167,6 +167,8 @@ final class MTPViewModel {
     @ObservationIgnored private var pendingThumbnailQueue: [UInt32] = []
     @ObservationIgnored private var thumbnailWorkerTask: Task<Void, Never>? = nil
     @ObservationIgnored private var previewLoadTask: Task<Void, Never>? = nil
+    @ObservationIgnored private var destinationLoadTask: Task<Void, Never>? = nil
+    @ObservationIgnored private var terminationObserver: NSObjectProtocol? = nil
     @ObservationIgnored private var folderItemsCache: [UInt32: [MTPObjectItem]] = [:]
     
     // Preview state
@@ -222,7 +224,36 @@ final class MTPViewModel {
     
     init() {
         guard !Self.isRunningInPreview else { return }
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.shutdown()
+            }
+        }
         startUSBMonitoring()
+    }
+    
+    func shutdown() {
+        usbMonitorTask?.cancel()
+        destinationLoadTask?.cancel()
+        thumbnailWorkerTask?.cancel()
+        previewLoadTask?.cancel()
+        previewPlayer?.pause()
+        previewPlayer = nil
+        client.disconnectBlocking()
+        Self.cleanupTemporaryDirectories()
+    }
+    
+    private static func cleanupTemporaryDirectories() {
+        let fm = FileManager.default
+        let tempBase = fm.temporaryDirectory
+        for folder in ["SwitchMTPPreview", "SwitchMTPDragDrop"] {
+            let dir = tempBase.appendingPathComponent(folder, isDirectory: true)
+            try? fm.removeItem(at: dir)
+        }
     }
     
     func startUSBMonitoring() {
@@ -293,6 +324,11 @@ final class MTPViewModel {
     }
     
     func refresh() async {
+        destinationLoadTask?.cancel()
+        thumbnailWorkerTask?.cancel()
+        thumbnailWorkerTask = nil
+        previewLoadTask?.cancel()
+        pendingThumbnailQueue.removeAll()
         folderItemsCache.removeAll()
         loadingThumbnails.removeAll()
         isLoadingThumbnails = false
@@ -302,6 +338,11 @@ final class MTPViewModel {
     }
     
     private func handleUnexpectedDisconnect() async {
+        destinationLoadTask?.cancel()
+        thumbnailWorkerTask?.cancel()
+        thumbnailWorkerTask = nil
+        previewLoadTask?.cancel()
+        pendingThumbnailQueue.removeAll()
         await client.disconnect()
         isConnected = false
         deviceDetails = nil
@@ -316,6 +357,7 @@ final class MTPViewModel {
         inspectedItem = nil
         previewImage = nil
         previewVideoURL = nil
+        previewPlayer?.pause()
         previewPlayer = nil
         errorMessage = nil
     }
@@ -324,19 +366,22 @@ final class MTPViewModel {
     
     private func handleSidebarSelectionChange() {
         selectedItemIDs.removeAll()
-        Task {
-            await loadSelectedDestination()
+        destinationLoadTask?.cancel()
+        destinationLoadTask = Task { [weak self] in
+            await self?.loadSelectedDestination()
         }
     }
     
     func loadSelectedDestination() async {
         guard isConnected, let primaryStorage = storages.first else { return }
+        let targetSidebar = selectedSidebar
         
-        switch selectedSidebar {
+        switch targetSidebar {
         case .allMedia:
             mediaFilter = .all
             breadcrumbs = [BreadcrumbStep(id: 0xFFFFFFFF, storageID: primaryStorage.id, title: "All Media")]
             await loadAllMediaIfNeeded(storage: primaryStorage)
+            guard !Task.isCancelled, selectedSidebar == targetSidebar else { return }
             currentItems = allMediaItems
             preloadVisibleThumbnails(for: filteredAndSortedItems)
             
@@ -344,6 +389,7 @@ final class MTPViewModel {
             mediaFilter = .screenshots
             breadcrumbs = [BreadcrumbStep(id: 0xFFFFFFFF, storageID: primaryStorage.id, title: "Screenshots")]
             await loadAllMediaIfNeeded(storage: primaryStorage)
+            guard !Task.isCancelled, selectedSidebar == targetSidebar else { return }
             currentItems = allMediaItems.filter(\.isImage)
             preloadVisibleThumbnails(for: filteredAndSortedItems)
             
@@ -351,6 +397,7 @@ final class MTPViewModel {
             mediaFilter = .videos
             breadcrumbs = [BreadcrumbStep(id: 0xFFFFFFFF, storageID: primaryStorage.id, title: "Videos")]
             await loadAllMediaIfNeeded(storage: primaryStorage)
+            guard !Task.isCancelled, selectedSidebar == targetSidebar else { return }
             currentItems = allMediaItems.filter(\.isVideo)
             preloadVisibleThumbnails(for: filteredAndSortedItems)
             
@@ -387,9 +434,11 @@ final class MTPViewModel {
         
         var aggregated: [MTPObjectItem] = []
         for folder in rootFolders {
-            while isTransferring {
+            guard !Task.isCancelled else { return }
+            while isTransferring && !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(100))
             }
+            guard !Task.isCancelled else { return }
             if let cached = folderItemsCache[folder.handle] {
                 aggregated.append(contentsOf: cached.filter { !$0.isFolder })
                 continue
@@ -401,6 +450,7 @@ final class MTPViewModel {
                     folderName: folder.filename,
                     includeChildCountsForFolders: false
                 )
+                guard !Task.isCancelled else { return }
                 folderItemsCache[folder.handle] = items
                 aggregated.append(contentsOf: items.filter { !$0.isFolder })
                 // Stream progressive results into view
@@ -419,6 +469,7 @@ final class MTPViewModel {
                 continue
             }
         }
+        guard !Task.isCancelled else { return }
         self.allMediaItems = aggregated
         self.hasLoadedAllMedia = true
     }
@@ -938,8 +989,18 @@ final class MTPViewModel {
                     }
                 } else if item.isVideo {
                     let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("SwitchMTPPreview", isDirectory: true)
-                    let tempURL = tempDir.appendingPathComponent(item.filename)
-                    if !FileManager.default.fileExists(atPath: tempURL.path) {
+                    let tempURL = tempDir.appendingPathComponent(Self.sanitizeFilename(item.filename))
+                    let fm = FileManager.default
+                    let hasValidCachedVideo: Bool = {
+                        guard fm.fileExists(atPath: tempURL.path),
+                              let attrs = try? fm.attributesOfItem(atPath: tempURL.path),
+                              let fileSize = attrs[.size] as? UInt64,
+                              fileSize > 0 else {
+                            return false
+                        }
+                        return item.compressedSize == 0 || fileSize == item.compressedSize
+                    }()
+                    if !hasValidCachedVideo {
                         try await client.downloadObjectToFile(item: item, destinationURL: tempURL)
                     }
                     guard self.fullScreenPreviewItem?.handle == handle else { return }
@@ -975,13 +1036,15 @@ final class MTPViewModel {
     
     func openInQuickLookOrDefaultApp(_ item: MTPObjectItem) {
         guard !item.isFolder else { return }
+        if let existingURL = dragCoordinator.existingCachedFileURL(for: item) {
+            NSWorkspace.shared.open(existingURL)
+            return
+        }
         Task {
             do {
                 let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("SwitchMTPQuickOpen", isDirectory: true)
-                let destURL = tempDir.appendingPathComponent(item.filename)
-                if !FileManager.default.fileExists(atPath: destURL.path) {
-                    try await exportItems([item], toDirectory: tempDir, revealWhenDone: false)
-                }
+                let destURL = tempDir.appendingPathComponent(Self.sanitizeFilename(item.filename))
+                try await exportItems([item], toDirectory: tempDir, revealWhenDone: false)
                 NSWorkspace.shared.open(destURL)
             } catch {
                 errorMessage = error.localizedDescription
@@ -995,11 +1058,15 @@ final class MTPViewModel {
             return
         }
         Task {
-            try? await exportItems(
-                items,
-                toDirectory: downloadsURL,
-                revealWhenDone: AppSettings.revealInFinderAfterExport
-            )
+            do {
+                try await exportItems(
+                    items,
+                    toDirectory: downloadsURL,
+                    revealWhenDone: AppSettings.revealInFinderAfterExport
+                )
+            } catch {
+                errorMessage = "Export failed: \(error.localizedDescription)"
+            }
         }
     }
     
@@ -1015,11 +1082,15 @@ final class MTPViewModel {
         
         if panel.runModal() == .OK, let destinationDir = panel.url {
             Task {
-                try? await exportItems(
-                    items,
-                    toDirectory: destinationDir,
-                    revealWhenDone: AppSettings.revealInFinderAfterExport
-                )
+                do {
+                    try await exportItems(
+                        items,
+                        toDirectory: destinationDir,
+                        revealWhenDone: AppSettings.revealInFinderAfterExport
+                    )
+                } catch {
+                    errorMessage = "Export failed: \(error.localizedDescription)"
+                }
             }
         }
     }
@@ -1045,25 +1116,15 @@ final class MTPViewModel {
         
         if panel.runModal() == .OK, let destinationDir = panel.url {
             Task {
-                var filesToExport: [MTPObjectItem] = []
-                for folder in folders where folder.isFolder {
-                    if let cached = folderItemsCache[folder.handle] {
-                        filesToExport.append(contentsOf: cached.filter { !$0.isFolder })
-                    } else if let fetched = try? await client.fetchDirectoryItems(
-                        storageID: folder.storageID,
-                        parentHandle: folder.handle,
-                        folderName: folder.filename,
-                        includeChildCountsForFolders: false
-                    ) {
-                        folderItemsCache[folder.handle] = fetched
-                        filesToExport.append(contentsOf: fetched.filter { !$0.isFolder })
-                    }
+                do {
+                    try await exportItems(
+                        folders,
+                        toDirectory: destinationDir,
+                        revealWhenDone: AppSettings.revealInFinderAfterExport
+                    )
+                } catch {
+                    errorMessage = "Export failed: \(error.localizedDescription)"
                 }
-                try? await exportItems(
-                    filesToExport,
-                    toDirectory: destinationDir,
-                    revealWhenDone: AppSettings.revealInFinderAfterExport
-                )
             }
         }
     }
@@ -1351,26 +1412,6 @@ nonisolated final class MTPDragExportCoordinator: NSObject, NSFilePromiseProvide
             }
         }
         return nil
-    }
-    
-    nonisolated func materializeToTempURLBlocking(for item: MTPObjectItem) throws -> URL {
-        if let existing = existingCachedFileURL(for: item) {
-            return existing
-        }
-        let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("SwitchMTPDragDrop", isDirectory: true)
-        let destURL = tempDir.appendingPathComponent(MTPViewModel.sanitizeFilename(item.filename))
-        try fulfillPromiseBlocking(for: item, destinationURL: destURL, showCompletionBanner: false)
-        return destURL
-    }
-    
-    nonisolated func materializeDataBlocking(for item: MTPObjectItem) throws -> Data {
-        if let existing = existingCachedFileURL(for: item),
-           let data = try? Data(contentsOf: existing) {
-            return data
-        }
-        let tempURL = try materializeToTempURLBlocking(for: item)
-        return try Data(contentsOf: tempURL)
     }
     
     nonisolated private func fulfillPromiseBlocking(
