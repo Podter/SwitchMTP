@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0). Leave empty to use v<MARKETING_VERSION>."
+        required: false
+        type: string
+      notes:
+        description: "Optional extra release notes"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build Unsigned Release & Create Draft
+    runs-on: xcode-27
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 27.2
+        run: |
+          if [ -d "/Applications/Xcode_27.2.app/Contents/Developer" ]; then
+            sudo xcode-select -s /Applications/Xcode_27.2.app/Contents/Developer
+          fi
+          xcodebuild -version
+
+      - name: Resolve release metadata
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="$INPUT_TAG"
+          if [ -z "$TAG" ]; then
+            VERSION=$(xcodebuild -project SwitchMTP.xcodeproj -scheme SwitchMTP -configuration Release -showBuildSettings | awk -F ' = ' '/^[[:space:]]*MARKETING_VERSION = / { print $2; exit }')
+            TAG="v${VERSION:-1.0}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Build unsigned Release .app
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project SwitchMTP.xcodeproj \
+            -scheme SwitchMTP \
+            -configuration Release \
+            -destination "generic/platform=macOS" \
+            -derivedDataPath "${{ runner.temp }}/DerivedData" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            build | xcbeautify
+
+      - name: Compress .app bundle
+        id: package
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          APP_PATH="${{ runner.temp }}/DerivedData/Build/Products/Release/SwitchMTP.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Error: Built application not found at $APP_PATH"
+            exit 1
+          fi
+
+          ARCHIVE_NAME="SwitchMTP-${RELEASE_TAG}.zip"
+          ARCHIVE_PATH="${{ runner.temp }}/${ARCHIVE_NAME}"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ARCHIVE_PATH"
+
+          echo "archive_name=$ARCHIVE_NAME" >> "$GITHUB_OUTPUT"
+          echo "archive_path=$ARCHIVE_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
+          EXTRA_NOTES: ${{ inputs.notes }}
+        run: |
+          NOTES_FILE="${{ runner.temp }}/release_notes.md"
+          cat > "$NOTES_FILE" <<EOF
+          ## Installation
+
+          1. Download and extract \`${ARCHIVE_NAME}\`.
+          2. Move \`SwitchMTP.app\` to \`/Applications\` (or another folder of your choice).
+          3. **Required:** Because this build is **unsigned**, macOS Gatekeeper will prevent it from opening until you clear its quarantine attribute. Run the following in Terminal before launching:
+
+          \`\`\`bash
+          xattr -cr /Applications/SwitchMTP.app
+          \`\`\`
+
+          *(If you placed \`SwitchMTP.app\` somewhere else, replace \`/Applications/SwitchMTP.app\` with the path to your \`.app\`.)*
+          EOF
+
+          if [ -n "$EXTRA_NOTES" ]; then
+            printf "\n## Release Notes\n\n%s\n" "$EXTRA_NOTES" >> "$NOTES_FILE"
+          fi
+
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          ARCHIVE_PATH: ${{ steps.package.outputs.archive_path }}
+        run: |
+          gh release create "$RELEASE_TAG" "$ARCHIVE_PATH" \
+            --draft \
+            --title "SwitchMTP $RELEASE_TAG" \
+            --target "${{ github.sha }}" \
+            --notes-file "${{ runner.temp }}/release_notes.md"

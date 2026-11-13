@@ -28,6 +28,19 @@ Because macOS does not mount MTP devices in Finder natively, SwitchMTP communica
   - **Export Selected / Export All** (`⇧⌘E` / `⌥⌘E`) to any folder, with optional **Organize by Game Folder** support.
   - **Copy Image to Clipboard** (`⇧⌘C`) for quick sharing.
 
+## Installation
+
+Download the latest `.zip` from [GitHub Releases](https://github.com/Podter/SwitchMTP/releases), extract it, and move `SwitchMTP.app` to `/Applications`.
+
+> [!IMPORTANT]
+> Pre-built releases are **unsigned**. After downloading, clearing the macOS quarantine attribute is **required** before opening the app:
+>
+> ```bash
+> xattr -cr /Applications/SwitchMTP.app
+> ```
+>
+> _(Replace `/Applications/SwitchMTP.app` with the path to your `.app` if you placed it elsewhere.)_
+
 ## How to Use
 
 1. Launch **SwitchMTP** on your Mac.
